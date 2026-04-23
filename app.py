@@ -3,7 +3,7 @@ import time
 import json
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, render_template_string, request
 
 import alpaca_trade_api as tradeapi
@@ -23,17 +23,14 @@ TIMEFRAME     = os.environ.get("TIMEFRAME", "5Min")
 STATE_FILE    = "/tmp/fvg_state.json"
 EXCEL_FILE    = "/tmp/fvg_trades.xlsx"
 
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+lock = threading.Lock()
 
 # ─────────────────────────────────────────────
 # STATE
 # ─────────────────────────────────────────────
-lock = threading.Lock()
-
 def default_state():
     return {
         "watchlist": [w.strip() for w in WATCHLIST_ENV.split(",") if w.strip()],
@@ -45,17 +42,17 @@ def default_state():
         "total_pnl": 0.0,
         "settings": {
             "timeframe":      TIMEFRAME,
-            "fvg_min_size":   0.001,   # BUG FIX: was 0.002, lowered so more FVGs qualify
+            "fvg_min_size":   0.001,
             "risk_per_trade": 0.02,
             "reward_ratio":   2.0,
             "max_positions":  3,
             "check_interval": 60,
             "use_rsi":        True,
-            "use_volume":     False,   # BUG FIX: was True, volume was blocking all trades
+            "use_volume":     False,
             "use_ema_trend":  True,
             "rsi_period":     14,
-            "rsi_oversold":   20,      # BUG FIX: was 35, blocked bearish trades at RSI 26-30
-            "rsi_overbought": 80,      # BUG FIX: was 65, too tight
+            "rsi_oversold":   20,
+            "rsi_overbought": 80,
             "volume_mult":    1.2,
         }
     }
@@ -121,19 +118,19 @@ def init_excel():
     wb  = openpyxl.Workbook()
     ws  = wb.active
     ws.title = "Trade Log"
-    headers  = ["Date","Time","Symbol","Side","Qty","Entry ($)","SL ($)","TP ($)",
-                 "Exit ($)","P&L ($)","P&L (%)","Status","FVG Type","Trend","RSI","Vol OK","Notes"]
+    headers = ["Date","Time","Symbol","Side","Qty","Entry ($)","SL ($)","TP ($)",
+               "Exit ($)","P&L ($)","P&L (%)","Status","FVG Type","Trend","RSI","Vol OK","Notes"]
     hfill = PatternFill("solid", fgColor="0D0D14")
     hfont = Font(bold=True, color="00FF88", name="Arial", size=10)
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
-        cell.font = hfont; cell.fill = hfill
+        cell.font = hfont
+        cell.fill = hfill
         cell.alignment = Alignment(horizontal="center", vertical="center")
     widths = [12,10,8,6,5,12,12,12,10,10,8,8,10,8,6,8,25]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.row_dimensions[1].height = 20
-
     ws2 = wb.create_sheet("Summary")
     ws2["A1"] = "FVG Bot — Trade Summary"
     ws2["A1"].font = Font(bold=True, size=14, color="00FF88", name="Arial")
@@ -196,6 +193,26 @@ def get_api():
     return tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 
 # ─────────────────────────────────────────────
+# MARKET OPEN CHECK
+# Uses both Alpaca clock AND manual UTC time check as fallback
+# ─────────────────────────────────────────────
+def is_market_open(api):
+    # Manual UTC check: market open 13:30-20:00 UTC Mon-Fri
+    utc_now    = datetime.now(timezone.utc)
+    utc_mins   = utc_now.hour * 60 + utc_now.minute
+    is_weekday = utc_now.weekday() < 5
+    manual_open = is_weekday and 810 <= utc_mins <= 1200
+    next_open  = ""
+    try:
+        clock      = api.get_clock()
+        alpaca_open = clock.is_open
+        next_open  = str(clock.next_open)[:16]
+        # Use OR — if either says open, we trade
+        return alpaca_open or manual_open, next_open
+    except:
+        return manual_open, next_open
+
+# ─────────────────────────────────────────────
 # MARKET DATA
 # ─────────────────────────────────────────────
 def get_candles(api, symbol, tf=None, hours=10, limit=100):
@@ -207,14 +224,12 @@ def get_candles(api, symbol, tf=None, hours=10, limit=100):
                              start=start.isoformat()+"Z",
                              end=end.isoformat()+"Z",
                              limit=limit, feed="iex").df
-        # BUG FIX: reset index to avoid timezone issues
         if hasattr(bars.index, 'tz') and bars.index.tz is not None:
             bars.index = bars.index.tz_localize(None)
         return bars if len(bars) >= 5 else None
     except Exception as e:
         err = str(e).lower()
-        # BUG FIX: only log real errors, not expected market-closed messages
-        if "subscription" not in err and "forbidden" not in err:
+        if "subscription" not in err and "forbidden" not in err and "market" not in err:
             add_log(f"⚠️ Candle {symbol}: {e}", "error")
         return None
 
@@ -228,7 +243,6 @@ def calculate_rsi(closes, period=14):
         rs    = gain / loss
         rsi   = 100 - (100 / (1 + rs))
         val   = float(rsi.iloc[-1])
-        # BUG FIX: handle NaN RSI
         return round(val, 1) if not pd.isna(val) else 50.0
     except:
         return 50.0
@@ -256,24 +270,18 @@ def get_trend(api, symbol):
 def detect_fvg(bars):
     fvgs     = []
     min_size = state["settings"]["fvg_min_size"]
-
     for i in range(2, len(bars)):
         c1 = bars.iloc[i-2]
         c2 = bars.iloc[i-1]
         c3 = bars.iloc[i]
-
-        # BUG FIX: relaxed body filter from 0.4 to 0.3
         c2_body  = abs(float(c2["close"]) - float(c2["open"]))
         c2_range = float(c2["high"]) - float(c2["low"])
         if c2_range == 0 or c2_body / c2_range < 0.3:
             continue
-
         c1_high = float(c1["high"])
         c3_low  = float(c3["low"])
         c1_low  = float(c1["low"])
         c3_high = float(c3["high"])
-
-        # Bullish FVG
         if c3_low > c1_high:
             gap = (c3_low - c1_high) / c1_high
             if gap >= min_size and float(c2["close"]) > float(c2["open"]):
@@ -282,13 +290,10 @@ def detect_fvg(bars):
                     "type":     "bullish",
                     "top":      c3_low,
                     "bottom":   c1_high,
-                    "mid":      (c3_low + c1_high) / 2,
                     "gap_size": round(gap * 100, 3),
                     "score":    score,
                     "c2_vol":   float(c2.get("volume", 0)),
                 })
-
-        # Bearish FVG
         elif c3_high < c1_low:
             gap = (c1_low - c3_high) / c1_low
             if gap >= min_size and float(c2["close"]) < float(c2["open"]):
@@ -297,12 +302,10 @@ def detect_fvg(bars):
                     "type":     "bearish",
                     "top":      c1_low,
                     "bottom":   c3_high,
-                    "mid":      (c1_low + c3_high) / 2,
                     "gap_size": round(gap * 100, 3),
                     "score":    score,
                     "c2_vol":   float(c2.get("volume", 0)),
                 })
-
     return sorted(fvgs, key=lambda x: x["score"], reverse=True)
 
 def check_volume(bars, fvg):
@@ -318,7 +321,6 @@ def check_volume(bars, fvg):
         return True
 
 def price_in_fvg(price, fvg):
-    # BUG FIX: also allow price within 0.1% below bottom (to catch entries just above)
     tolerance = fvg["bottom"] * 0.001
     return (fvg["bottom"] - tolerance) <= price <= fvg["top"]
 
@@ -330,28 +332,22 @@ def calculate_qty(equity, entry, stop_loss):
         return 0
     shares     = risk_amt / risk_share
     max_shares = (equity * 0.25) / entry
-    qty        = int(min(shares, max_shares))
-    # BUG FIX: ensure fractional shares work — use 1 minimum
-    return max(1, qty)
+    return max(1, int(min(shares, max_shares)))
 
 # ─────────────────────────────────────────────
 # TRADE EXECUTION
 # ─────────────────────────────────────────────
 def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi, volume_ok):
     try:
-        # BUG FIX: round all prices to 2 decimal places
         entry = round(float(entry), 2)
         sl    = round(float(sl), 2)
         tp    = round(float(tp), 2)
-
-        # BUG FIX: validate sl/tp logic before placing
         if side == "buy" and (sl >= entry or tp <= entry):
-            add_log(f"⚠️ Invalid SL/TP for BUY {symbol} — skipping", "error")
+            add_log(f"⚠️ Invalid SL/TP BUY {symbol} entry={entry} sl={sl} tp={tp}", "error")
             return
         if side == "sell" and (sl <= entry or tp >= entry):
-            add_log(f"⚠️ Invalid SL/TP for SELL {symbol} — skipping", "error")
+            add_log(f"⚠️ Invalid SL/TP SELL {symbol} entry={entry} sl={sl} tp={tp}", "error")
             return
-
         api.submit_order(
             symbol=symbol, qty=qty, side=side,
             type="limit", time_in_force="day",
@@ -361,7 +357,6 @@ def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi, volume_o
             take_profit={"limit_price": tp}
         )
         add_log(f"✅ {side.upper()} {qty} {symbol} @ ${entry} SL:${sl} TP:${tp} RSI:{rsi} {trend}", "trade")
-
         trade = {
             "time":       datetime.now().strftime("%H:%M:%S"),
             "date":       datetime.now().strftime("%d %b %Y"),
@@ -395,7 +390,6 @@ def update_closed_trades(api):
         orders    = api.list_orders(status="closed", limit=50)
         total_pnl = 0.0
         wins = losses = 0
-
         with lock:
             for t in state["trades"]:
                 if t["status"] != "OPEN":
@@ -406,9 +400,8 @@ def update_closed_trades(api):
                 for o in orders:
                     if o.symbol != t["symbol"]: continue
                     if o.filled_avg_price is None: continue
-                    fp  = float(o.filled_avg_price)
-                    fq  = float(o.filled_qty or 0)
-                    # BUG FIX: match closing order correctly
+                    fp     = float(o.filled_avg_price)
+                    fq     = float(o.filled_qty or 0)
                     o_side = str(o.side).lower()
                     if t["side"] == "buy" and o_side == "sell":
                         pnl = (fp - t["entry"]) * fq
@@ -430,7 +423,6 @@ def update_closed_trades(api):
                         else: losses += 1
                         log_trade_excel(t)
                         break
-
             state["total_pnl"] = round(total_pnl, 2)
             state["wins"]      = wins
             state["losses"]    = losses
@@ -445,7 +437,7 @@ def bot_loop():
     add_log("🤖 FVG Bot started — FVG + EMA + RSI")
     api = get_api()
 
-    # Fetch account immediately on start
+    # Fetch account immediately
     try:
         acc = api.get_account()
         with lock:
@@ -461,7 +453,7 @@ def bot_loop():
                 break
 
         try:
-            # Always refresh account
+            # Refresh account
             try:
                 acc = api.get_account()
                 with lock:
@@ -470,31 +462,16 @@ def bot_loop():
             except:
                 pass
 
-            # Check market hours via Alpaca clock
-           from datetime import timezone
-utc_now   = datetime.now(timezone.utc)
-utc_mins  = utc_now.hour * 60 + utc_now.minute
-is_weekday = utc_now.weekday() < 5
-manual_open = is_weekday and 810 <= utc_mins <= 1200
+            # Market open check — uses Alpaca + manual UTC fallback
+            market_open, next_open = is_market_open(api)
+            with lock:
+                runtime["market_open"] = market_open
+                runtime["next_open"]   = next_open
 
-try:
-    clock = api.get_clock()
-    alpaca_open = clock.is_open
-    next_open   = str(clock.next_open)[:16]
-except:
-    alpaca_open = False
-    next_open   = ""
-
-market_open = alpaca_open or manual_open
-
-with lock:
-    runtime["market_open"] = market_open
-    runtime["next_open"]   = next_open
-
-if not market_open:
-    add_log(f"💤 Market closed — next open: {next_open}")
-    time.sleep(60)
-    continue
+            if not market_open:
+                add_log(f"💤 Market closed — next open: {next_open}")
+                time.sleep(60)
+                continue
 
             positions = api.list_positions()
             pos_dict  = {p.symbol: p for p in positions}
@@ -520,7 +497,7 @@ if not market_open:
             s       = state["settings"]
             max_pos = s["max_positions"]
 
-            add_log(f"📡 Scanning {len(state['watchlist'])} stocks | ${equity:,.0f} | {len(pos_dict)}/{max_pos} positions")
+            add_log(f"📡 Scanning {len(state['watchlist'])} stocks | ${equity:,.0f} | {len(pos_dict)}/{max_pos} pos")
 
             if len(pos_dict) >= max_pos:
                 add_log(f"⚠️ Max {max_pos} positions — waiting")
@@ -544,17 +521,10 @@ if not market_open:
 
                 price  = float(bars["close"].iloc[-1])
                 closes = bars["close"]
+                rsi    = calculate_rsi(closes, int(s["rsi_period"]))
+                trend  = get_trend(api, symbol) if s["use_ema_trend"] else "neutral"
+                fvgs   = detect_fvg(bars)
 
-                # RSI
-                rsi = calculate_rsi(closes, int(s["rsi_period"]))
-
-                # EMA Trend
-                trend = "neutral"
-                if s["use_ema_trend"]:
-                    trend = get_trend(api, symbol)
-
-                # FVG Detection
-                fvgs = detect_fvg(bars)
                 if not fvgs:
                     continue
 
@@ -565,15 +535,12 @@ if not market_open:
                     if not price_in_fvg(price, fvg):
                         continue
 
-                    # Volume check
                     volume_ok = check_volume(bars, fvg) if s["use_volume"] else True
+                    reward    = s["reward_ratio"]
 
                     add_log(f"🎯 {symbol} FVG({fvg['type']}) gap={fvg['gap_size']}% RSI={rsi} trend={trend} vol={'✅' if volume_ok else '❌'}")
 
-                    reward = s["reward_ratio"]
-
                     # BULLISH ENTRY
-                    # BUG FIX: RSI filter was too strict — now only blocks extreme overbought
                     if fvg["type"] == "bullish" and trend in ["bullish", "neutral"]:
                         rsi_ok = rsi < s["rsi_overbought"] if s["use_rsi"] else True
                         if rsi_ok and volume_ok:
@@ -586,7 +553,6 @@ if not market_open:
                                 break
 
                     # BEARISH ENTRY
-                    # BUG FIX: RSI filter was blocking at 30 — now only blocks extreme oversold
                     elif fvg["type"] == "bearish" and trend in ["bearish", "neutral"]:
                         rsi_ok = rsi > s["rsi_oversold"] if s["use_rsi"] else True
                         if rsi_ok and volume_ok:
@@ -626,7 +592,6 @@ def index():
 
 @app.route("/api/status")
 def api_status():
-    # Always fetch live account data
     try:
         acc = get_api().get_account()
         with lock:
