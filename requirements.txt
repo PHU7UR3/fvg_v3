@@ -1,0 +1,7 @@
+alpaca-trade-api==3.2.0
+pandas==2.1.0
+numpy==1.25.2
+requests==2.31.0
+flask==3.0.0
+gunicorn==21.2.0
+openpyxl==3.1.2

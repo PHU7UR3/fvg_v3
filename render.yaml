@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: fvg-trading-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: PYTHON_VERSION
+        value: 3.11.0
