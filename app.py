@@ -150,38 +150,59 @@ def init_excel():
     ws2["B10"] = "=IFERROR(MIN('Trade Log'!J2:J10000),0)"
     wb.save(EXCEL_FILE)
 
+def write_excel_row(ws, nr, trade):
+    pnl = trade.get("pnl", 0.0)
+    ent = trade.get("entry", 1)
+    qty = trade.get("qty", 1)
+    pct = round((pnl / (ent * qty)) * 100, 2) if ent and qty else 0
+    st  = trade.get("status", "OPEN")
+    row = [trade.get("date",""), trade.get("time",""), trade.get("symbol",""),
+           trade.get("side","").upper(), qty, ent,
+           trade.get("sl",0), trade.get("tp",0),
+           trade.get("exit_price","") or "",
+           round(pnl,2), pct, st, trade.get("fvg_type",""),
+           trade.get("trend",""), trade.get("rsi",""), trade.get("notes","")]
+    for col, val in enumerate(row, 1):
+        cell = ws.cell(row=nr, column=col, value=val)
+        cell.font = Font(name="Arial", size=9)
+        cell.alignment = Alignment(horizontal="center")
+        if col == 10 and isinstance(val, (int, float)):
+            cell.font = Font(name="Arial", size=9,
+                color="00AA44" if val>0 else "CC0000" if val<0 else "888888")
+        if col == 12:
+            if val == "WIN":
+                cell.fill = PatternFill("solid", fgColor="002200")
+                cell.font = Font(name="Arial", size=9, color="00FF88", bold=True)
+            elif val == "LOSS":
+                cell.fill = PatternFill("solid", fgColor="220000")
+                cell.font = Font(name="Arial", size=9, color="FF3D6E", bold=True)
+            else:
+                cell.fill = PatternFill("solid", fgColor="1a1a2e")
+                cell.font = Font(name="Arial", size=9, color="FFD166", bold=True)
+        if col == 4:
+            cell.font = Font(name="Arial", size=9,
+                color="00FF88" if val=="BUY" else "FF3D6E", bold=True)
+
 def log_trade_excel(trade):
     try:
-        wb  = openpyxl.load_workbook(EXCEL_FILE)
-        ws  = wb["Trade Log"]
-        nr  = ws.max_row + 1
-        pnl = trade.get("pnl", 0.0)
-        ent = trade.get("entry", 1)
-        qty = trade.get("qty", 1)
-        pct = round((pnl / (ent * qty)) * 100, 2) if ent and qty else 0
-        st  = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "OPEN")
-        row = [trade.get("date",""), trade.get("time",""), trade.get("symbol",""),
-               trade.get("side","").upper(), qty, ent,
-               trade.get("sl",0), trade.get("tp",0), trade.get("exit_price",""),
-               round(pnl,2), pct, st, trade.get("fvg_type",""),
-               trade.get("trend",""), trade.get("rsi",""), trade.get("notes","")]
-        for col, val in enumerate(row, 1):
-            cell = ws.cell(row=nr, column=col, value=val)
-            cell.font = Font(name="Arial", size=9)
-            cell.alignment = Alignment(horizontal="center")
-            if col == 10 and isinstance(val, (int, float)):
-                cell.font = Font(name="Arial", size=9,
-                    color="00AA44" if val>0 else "CC0000" if val<0 else "888888")
-            if col == 12:
-                if val == "WIN":
-                    cell.fill = PatternFill("solid", fgColor="002200")
-                    cell.font = Font(name="Arial", size=9, color="00FF88", bold=True)
-                elif val == "LOSS":
-                    cell.fill = PatternFill("solid", fgColor="220000")
-                    cell.font = Font(name="Arial", size=9, color="FF3D6E", bold=True)
-            if col == 4:
-                cell.font = Font(name="Arial", size=9,
-                    color="00FF88" if val=="BUY" else "FF3D6E", bold=True)
+        wb = openpyxl.load_workbook(EXCEL_FILE)
+        ws = wb["Trade Log"]
+        if trade.get("excel_row"):
+            write_excel_row(ws, trade["excel_row"], trade)
+        else:
+            existing_row = None
+            for r in range(2, ws.max_row + 1):
+                if (ws.cell(row=r, column=3).value == trade.get("symbol") and
+                    ws.cell(row=r, column=2).value == trade.get("time")):
+                    existing_row = r
+                    break
+            if existing_row:
+                trade["excel_row"] = existing_row
+                write_excel_row(ws, existing_row, trade)
+            else:
+                nr = ws.max_row + 1
+                trade["excel_row"] = nr
+                write_excel_row(ws, nr, trade)
         wb.save(EXCEL_FILE)
     except Exception as e:
         log.error(f"Excel error: {e}")
