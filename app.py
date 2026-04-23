@@ -471,21 +471,30 @@ def bot_loop():
                 pass
 
             # Check market hours via Alpaca clock
-            clock = api.get_clock()
-            with lock:
-                runtime["market_open"] = clock.is_open
-                # BUG FIX: convert next_open to IST for display
-                try:
-                    next_open_utc = clock.next_open
-                    # next_open_utc is already a datetime string from Alpaca
-                    runtime["next_open"] = str(next_open_utc)[:16]
-                except:
-                    runtime["next_open"] = ""
+           from datetime import timezone
+utc_now   = datetime.now(timezone.utc)
+utc_mins  = utc_now.hour * 60 + utc_now.minute
+is_weekday = utc_now.weekday() < 5
+manual_open = is_weekday and 810 <= utc_mins <= 1200
 
-            if not clock.is_open:
-                add_log(f"💤 Market closed — next open (UTC): {runtime['next_open']}")
-                time.sleep(300)
-                continue
+try:
+    clock = api.get_clock()
+    alpaca_open = clock.is_open
+    next_open   = str(clock.next_open)[:16]
+except:
+    alpaca_open = False
+    next_open   = ""
+
+market_open = alpaca_open or manual_open
+
+with lock:
+    runtime["market_open"] = market_open
+    runtime["next_open"]   = next_open
+
+if not market_open:
+    add_log(f"💤 Market closed — next open: {next_open}")
+    time.sleep(60)
+    continue
 
             positions = api.list_positions()
             pos_dict  = {p.symbol: p for p in positions}
