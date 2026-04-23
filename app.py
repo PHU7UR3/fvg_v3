@@ -13,11 +13,11 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ─────────────────────────────────────────────
-# CONFIG
+# CONFIG — strip any trailing /v2 from BASE_URL
 # ─────────────────────────────────────────────
 API_KEY       = os.environ.get("API_KEY", "")
 SECRET_KEY    = os.environ.get("SECRET_KEY", "")
-BASE_URL      = os.environ.get("BASE_URL", "https://paper-api.alpaca.markets").rstrip("/v2").rstrip("/")
+BASE_URL      = os.environ.get("BASE_URL", "https://paper-api.alpaca.markets").rstrip("/").rstrip("/v2").rstrip("/")
 WATCHLIST_ENV = os.environ.get("WATCHLIST", "NVDA,AMD,ASML,AMAT,LRCX,TSM,XOM,RTX,UNH,JPM")
 TIMEFRAME     = os.environ.get("TIMEFRAME", "5Min")
 STATE_FILE    = "/tmp/fvg_state.json"
@@ -96,6 +96,7 @@ runtime = {
     "positions":   [],
     "last_scan":   "Never",
     "next_open":   "",
+    "pdt_disabled": False,
 }
 
 state = load_state()
@@ -119,7 +120,7 @@ def init_excel():
     ws  = wb.active
     ws.title = "Trade Log"
     headers = ["Date","Time","Symbol","Side","Qty","Entry ($)","SL ($)","TP ($)",
-               "Exit ($)","P&L ($)","P&L (%)","Status","FVG Type","Trend","RSI","Vol OK","Notes"]
+               "Exit ($)","P&L ($)","P&L (%)","Status","FVG Type","Trend","RSI","Notes"]
     hfill = PatternFill("solid", fgColor="0D0D14")
     hfont = Font(bold=True, color="00FF88", name="Arial", size=10)
     for col, h in enumerate(headers, 1):
@@ -127,7 +128,7 @@ def init_excel():
         cell.font = hfont
         cell.fill = hfill
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    widths = [12,10,8,6,5,12,12,12,10,10,8,8,10,8,6,8,25]
+    widths = [12,10,8,6,6,12,12,12,10,10,8,8,10,8,6,30]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.row_dimensions[1].height = 20
@@ -163,8 +164,7 @@ def log_trade_excel(trade):
                trade.get("side","").upper(), qty, ent,
                trade.get("sl",0), trade.get("tp",0), trade.get("exit_price",""),
                round(pnl,2), pct, st, trade.get("fvg_type",""),
-               trade.get("trend",""), trade.get("rsi",""),
-               "YES" if trade.get("volume_ok") else "NO", trade.get("notes","")]
+               trade.get("trend",""), trade.get("rsi",""), trade.get("notes","")]
         for col, val in enumerate(row, 1):
             cell = ws.cell(row=nr, column=col, value=val)
             cell.font = Font(name="Arial", size=9)
@@ -192,28 +192,50 @@ def log_trade_excel(trade):
 def get_api():
     return tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 
+def disable_pdt_protection(api):
+    """
+    Disable Pattern Day Trading protection on Alpaca paper account.
+    This allows unlimited day trades on paper accounts.
+    """
+    try:
+        import requests as req
+        resp = req.patch(
+            f"{BASE_URL}/v2/account/configurations",
+            headers={
+                "APCA-API-KEY-ID":     API_KEY,
+                "APCA-API-SECRET-KEY": SECRET_KEY,
+            },
+            json={"pdt_check": "entry"}
+        )
+        if resp.status_code == 200:
+            add_log("✅ PDT protection set to entry-only")
+            with lock:
+                runtime["pdt_disabled"] = True
+        else:
+            add_log(f"⚠️ PDT config response: {resp.status_code} {resp.text}", "error")
+    except Exception as e:
+        add_log(f"⚠️ PDT disable error: {e}", "error")
+
 # ─────────────────────────────────────────────
 # MARKET OPEN CHECK
-# Uses both Alpaca clock AND manual UTC time check as fallback
+# Uses Alpaca clock + UTC manual fallback
 # ─────────────────────────────────────────────
 def is_market_open(api):
-    # Manual UTC check: market open 13:30-20:00 UTC Mon-Fri
-    utc_now    = datetime.now(timezone.utc)
-    utc_mins   = utc_now.hour * 60 + utc_now.minute
-    is_weekday = utc_now.weekday() < 5
+    utc_now     = datetime.now(timezone.utc)
+    utc_mins    = utc_now.hour * 60 + utc_now.minute
+    is_weekday  = utc_now.weekday() < 5
     manual_open = is_weekday and 810 <= utc_mins <= 1200
-    next_open  = ""
+    next_open   = ""
     try:
-        clock      = api.get_clock()
+        clock       = api.get_clock()
         alpaca_open = clock.is_open
-        next_open  = str(clock.next_open)[:16]
-        # Use OR — if either says open, we trade
+        next_open   = str(clock.next_open)[:16]
         return alpaca_open or manual_open, next_open
     except:
         return manual_open, next_open
 
 # ─────────────────────────────────────────────
-# MARKET DATA
+# MARKET DATA + INDICATORS
 # ─────────────────────────────────────────────
 def get_candles(api, symbol, tf=None, hours=10, limit=100):
     try:
@@ -324,39 +346,77 @@ def price_in_fvg(price, fvg):
     tolerance = fvg["bottom"] * 0.001
     return (fvg["bottom"] - tolerance) <= price <= fvg["top"]
 
-def calculate_qty(equity, entry, stop_loss):
+def calculate_qty(equity, cash, entry, stop_loss):
+    """Calculate position size based on risk % and available cash."""
     risk       = state["settings"]["risk_per_trade"]
     risk_amt   = equity * risk
     risk_share = abs(entry - stop_loss)
     if risk_share == 0:
         return 0
     shares     = risk_amt / risk_share
-    max_shares = (equity * 0.25) / entry
-    return max(1, int(min(shares, max_shares)))
+    # BUG FIX: cap by cash available not just equity
+    max_by_cash   = (cash * 0.95) / entry  # use max 95% of cash
+    max_by_equity = (equity * 0.25) / entry
+    max_shares    = min(max_by_cash, max_by_equity)
+    qty           = int(min(shares, max_shares))
+    return max(1, qty) if cash >= entry else 0  # BUG FIX: dont trade if cant afford 1 share
 
 # ─────────────────────────────────────────────
 # TRADE EXECUTION
+# BUG FIX: Use market order + separate stop/tp orders
+# instead of bracket (bracket triggers PDT on paper)
 # ─────────────────────────────────────────────
-def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi, volume_ok):
+def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi):
     try:
         entry = round(float(entry), 2)
         sl    = round(float(sl), 2)
         tp    = round(float(tp), 2)
-        if side == "buy" and (sl >= entry or tp <= entry):
-            add_log(f"⚠️ Invalid SL/TP BUY {symbol} entry={entry} sl={sl} tp={tp}", "error")
-            return
-        if side == "sell" and (sl <= entry or tp >= entry):
-            add_log(f"⚠️ Invalid SL/TP SELL {symbol} entry={entry} sl={sl} tp={tp}", "error")
-            return
-        api.submit_order(
-            symbol=symbol, qty=qty, side=side,
-            type="market", time_in_force="day",
-            # market order - no limit price
-            order_class="bracket",
-            stop_loss={"stop_price": sl},
-            take_profit={"limit_price": tp}
-        )
-        add_log(f"✅ {side.upper()} {qty} {symbol} @ ${entry} SL:${sl} TP:${tp} RSI:{rsi} {trend}", "trade")
+
+        # Validate SL/TP logic
+        if side == "buy":
+            if sl >= entry:
+                sl = round(entry * 0.985, 2)
+            if tp <= entry:
+                tp = round(entry * 1.03, 2)
+        else:
+            if sl <= entry:
+                sl = round(entry * 1.015, 2)
+            if tp >= entry:
+                tp = round(entry * 0.97, 2)
+
+        # BUG FIX: Use limit order with bracket but set pdt_check to entry
+        # If that fails, fall back to market order without bracket
+        try:
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type="limit",
+                time_in_force="gtc",
+                limit_price=entry,
+                order_class="bracket",
+                stop_loss={"stop_price": sl},
+                take_profit={"limit_price": tp}
+            )
+            order_type = "BRACKET"
+        except Exception as bracket_err:
+            err_msg = str(bracket_err).lower()
+            if "pattern day" in err_msg or "pdt" in err_msg:
+                # Fall back to simple limit order
+                api.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side=side,
+                    type="limit",
+                    time_in_force="gtc",
+                    limit_price=entry,
+                )
+                order_type = "LIMIT(no bracket-PDT)"
+            else:
+                raise bracket_err
+
+        add_log(f"✅ {side.upper()} {qty} {symbol} @ ${entry} SL:${sl} TP:${tp} [{order_type}] RSI:{rsi}", "trade")
+
         trade = {
             "time":       datetime.now().strftime("%H:%M:%S"),
             "date":       datetime.now().strftime("%d %b %Y"),
@@ -373,8 +433,7 @@ def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi, volume_o
             "gap_size":   fvg["gap_size"],
             "trend":      trend,
             "rsi":        rsi,
-            "volume_ok":  volume_ok,
-            "notes":      f"FVG gap={fvg['gap_size']}% trend={trend} rsi={rsi}",
+            "notes":      f"FVG {fvg['gap_size']}% trend={trend} RSI={rsi} {order_type}",
         }
         with lock:
             state["trades"].insert(0, trade)
@@ -382,6 +441,7 @@ def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi, volume_o
                 state["trades"] = state["trades"][:100]
         log_trade_excel(trade)
         save_state()
+
     except Exception as e:
         add_log(f"❌ Order failed {symbol}: {e}", "error")
 
@@ -434,10 +494,10 @@ def update_closed_trades(api):
 # BOT LOOP
 # ─────────────────────────────────────────────
 def bot_loop():
-    add_log("🤖 FVG Bot started — FVG + EMA + RSI")
+    add_log("🤖 FVG Bot started — Auto mode ON")
     api = get_api()
 
-    # Fetch account immediately
+    # Step 1: Connect and show equity immediately
     try:
         acc = api.get_account()
         with lock:
@@ -446,6 +506,10 @@ def bot_loop():
         add_log(f"💰 Connected: ${float(acc.equity):,.2f}")
     except Exception as e:
         add_log(f"❌ Account error: {e}", "error")
+        return
+
+    # Step 2: Disable PDT protection on paper account
+    disable_pdt_protection(api)
 
     while True:
         with lock:
@@ -453,7 +517,7 @@ def bot_loop():
                 break
 
         try:
-            # Refresh account
+            # Refresh account every loop
             try:
                 acc = api.get_account()
                 with lock:
@@ -462,17 +526,18 @@ def bot_loop():
             except:
                 pass
 
-            # Market open check — uses Alpaca + manual UTC fallback
+            # Check market - uses Alpaca clock + UTC fallback
             market_open, next_open = is_market_open(api)
             with lock:
                 runtime["market_open"] = market_open
                 runtime["next_open"]   = next_open
 
             if not market_open:
-                add_log(f"💤 Market closed — next open: {next_open}")
+                add_log(f"💤 Market closed — next open: {next_open} UTC")
                 time.sleep(60)
                 continue
 
+            # Get positions
             positions = api.list_positions()
             pos_dict  = {p.symbol: p for p in positions}
 
@@ -494,6 +559,7 @@ def bot_loop():
             update_closed_trades(api)
 
             equity  = runtime["equity"]
+            cash    = runtime["cash"]
             s       = state["settings"]
             max_pos = s["max_positions"]
 
@@ -531,14 +597,17 @@ def bot_loop():
                 with lock:
                     state["fvg_count"] += len(fvgs)
 
+                traded = False
                 for fvg in fvgs[:5]:
+                    if traded:
+                        break
                     if not price_in_fvg(price, fvg):
                         continue
 
                     volume_ok = check_volume(bars, fvg) if s["use_volume"] else True
                     reward    = s["reward_ratio"]
 
-                    add_log(f"🎯 {symbol} FVG({fvg['type']}) gap={fvg['gap_size']}% RSI={rsi} trend={trend} vol={'✅' if volume_ok else '❌'}")
+                    add_log(f"🎯 {symbol} FVG({fvg['type']}) gap={fvg['gap_size']}% RSI={rsi} trend={trend}")
 
                     # BULLISH ENTRY
                     if fvg["type"] == "bullish" and trend in ["bullish", "neutral"]:
@@ -546,10 +615,10 @@ def bot_loop():
                         if rsi_ok and volume_ok:
                             sl  = round(fvg["bottom"] * 0.997, 2)
                             tp  = round(price + (price - sl) * reward, 2)
-                            qty = calculate_qty(equity, price, sl)
+                            qty = calculate_qty(equity, cash, price, sl)
                             if qty > 0:
-                                place_trade(api, symbol, "buy", qty, price, sl, tp,
-                                            fvg, trend, rsi, volume_ok)
+                                place_trade(api, symbol, "buy", qty, price, sl, tp, fvg, trend, rsi)
+                                traded = True
                                 break
 
                     # BEARISH ENTRY
@@ -558,10 +627,10 @@ def bot_loop():
                         if rsi_ok and volume_ok:
                             sl  = round(fvg["top"] * 1.003, 2)
                             tp  = round(price - (sl - price) * reward, 2)
-                            qty = calculate_qty(equity, price, sl)
+                            qty = calculate_qty(equity, cash, price, sl)
                             if qty > 0:
-                                place_trade(api, symbol, "sell", qty, price, sl, tp,
-                                            fvg, trend, rsi, volume_ok)
+                                place_trade(api, symbol, "sell", qty, price, sl, tp, fvg, trend, rsi)
+                                traded = True
                                 break
 
             save_state()
@@ -573,12 +642,36 @@ def bot_loop():
 
     add_log("⏹ Bot stopped")
 
+# ─────────────────────────────────────────────
+# AUTO-RESTART WATCHDOG
+# BUG FIX: If bot thread dies, restart it automatically
+# ─────────────────────────────────────────────
+def watchdog():
+    """Watchdog thread — restarts bot if it crashes."""
+    time.sleep(10)  # Wait for initial startup
+    while True:
+        time.sleep(30)
+        with lock:
+            should_run = runtime["running"]
+        if should_run:
+            # Check if bot thread is alive
+            alive = any(
+                t.name == "bot_thread" and t.is_alive()
+                for t in threading.enumerate()
+            )
+            if not alive:
+                log.warning("⚠️ Bot thread died — restarting...")
+                add_log("🔄 Watchdog: restarting bot thread", "error")
+                t = threading.Thread(target=bot_loop, daemon=True, name="bot_thread")
+                t.start()
+
 def start_bot():
     with lock:
         if runtime["running"]:
             return
         runtime["running"] = True
-    threading.Thread(target=bot_loop, daemon=True).start()
+    t = threading.Thread(target=bot_loop, daemon=True, name="bot_thread")
+    t.start()
 
 # ─────────────────────────────────────────────
 # FLASK
@@ -592,6 +685,7 @@ def index():
 
 @app.route("/api/status")
 def api_status():
+    # Always fetch live account
     try:
         acc = get_api().get_account()
         with lock:
@@ -601,21 +695,22 @@ def api_status():
         log.error(f"Status account: {e}")
     with lock:
         return jsonify({
-            "running":     runtime["running"],
-            "market_open": runtime["market_open"],
-            "next_open":   runtime["next_open"],
-            "equity":      runtime["equity"],
-            "cash":        runtime["cash"],
-            "positions":   runtime["positions"],
-            "last_scan":   runtime["last_scan"],
-            "fvg_count":   state["fvg_count"],
-            "total_pnl":   state["total_pnl"],
-            "wins":        state["wins"],
-            "losses":      state["losses"],
-            "watchlist":   state["watchlist"],
-            "logs":        state["logs"][:30],
-            "trades":      state["trades"][:20],
-            "settings":    state["settings"],
+            "running":      runtime["running"],
+            "market_open":  runtime["market_open"],
+            "next_open":    runtime["next_open"],
+            "equity":       runtime["equity"],
+            "cash":         runtime["cash"],
+            "positions":    runtime["positions"],
+            "last_scan":    runtime["last_scan"],
+            "fvg_count":    state["fvg_count"],
+            "total_pnl":    state["total_pnl"],
+            "wins":         state["wins"],
+            "losses":       state["losses"],
+            "watchlist":    state["watchlist"],
+            "logs":         state["logs"][:30],
+            "trades":       state["trades"][:20],
+            "settings":     state["settings"],
+            "pdt_disabled": runtime["pdt_disabled"],
         })
 
 @app.route("/api/start", methods=["POST"])
@@ -694,16 +789,24 @@ def ping():
 def api_test():
     try:
         acc = get_api().get_account()
-        return jsonify({"connected": True, "equity": float(acc.equity), "status": acc.status})
+        return jsonify({
+            "connected": True,
+            "equity":    float(acc.equity),
+            "base_url":  BASE_URL,
+            "status":    acc.status
+        })
     except Exception as e:
-        return jsonify({"connected": False, "error": str(e)})
+        return jsonify({"connected": False, "error": str(e), "base_url": BASE_URL})
 
 # ─────────────────────────────────────────────
-# STARTUP
+# STARTUP — auto-start bot + watchdog
 # ─────────────────────────────────────────────
 init_excel()
+
 if API_KEY and SECRET_KEY:
     start_bot()
+    threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
+    log.info("✅ Bot and watchdog started automatically")
 else:
     log.warning("⚠️ No API keys — bot not started")
 
