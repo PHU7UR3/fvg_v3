@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 # ─────────────────────────────────────────────
 API_KEY       = os.environ.get("API_KEY", "")
 SECRET_KEY    = os.environ.get("SECRET_KEY", "")
-BASE_URL      = os.environ.get("BASE_URL", "https://paper-api.alpaca.markets")
+BASE_URL      = os.environ.get("BASE_URL", "https://paper-api.alpaca.markets").rstrip("/v2").rstrip("/")
 WATCHLIST_ENV = os.environ.get("WATCHLIST", "NVDA,AMD,ASML,AMAT,LRCX,TSM,XOM,RTX,UNH,JPM")
 TIMEFRAME     = os.environ.get("TIMEFRAME", "5Min")
 STATE_FILE    = "/tmp/fvg_state.json"
@@ -350,8 +350,8 @@ def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi, volume_o
             return
         api.submit_order(
             symbol=symbol, qty=qty, side=side,
-            type="limit", time_in_force="gtc",
-            limit_price=entry,
+            type="market", time_in_force="day",
+            # market order - no limit price
             order_class="bracket",
             stop_loss={"stop_price": sl},
             take_profit={"limit_price": tp}
