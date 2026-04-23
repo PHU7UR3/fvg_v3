@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import logging
@@ -9,15 +10,16 @@ from flask import Flask, jsonify, render_template_string, request
 import alpaca_trade_api as tradeapi
 import pandas as pd
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 # ─────────────────────────────────────────────
-# CONFIG — strip any trailing /v2 from BASE_URL
+# CONFIG
 # ─────────────────────────────────────────────
 API_KEY       = os.environ.get("API_KEY", "")
 SECRET_KEY    = os.environ.get("SECRET_KEY", "")
-BASE_URL      = os.environ.get("BASE_URL", "https://paper-api.alpaca.markets").rstrip("/").rstrip("/v2").rstrip("/")
+_raw_url      = os.environ.get("BASE_URL", "https://paper-api.alpaca.markets")
+BASE_URL      = re.sub(r'/v2/?$', '', _raw_url).rstrip('/')
 WATCHLIST_ENV = os.environ.get("WATCHLIST", "NVDA,AMD,ASML,AMAT,LRCX,TSM,XOM,RTX,UNH,JPM")
 TIMEFRAME     = os.environ.get("TIMEFRAME", "5Min")
 STATE_FILE    = "/tmp/fvg_state.json"
@@ -25,7 +27,6 @@ EXCEL_FILE    = "/tmp/fvg_trades.xlsx"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
 lock = threading.Lock()
 
 # ─────────────────────────────────────────────
@@ -34,26 +35,15 @@ lock = threading.Lock()
 def default_state():
     return {
         "watchlist": [w.strip() for w in WATCHLIST_ENV.split(",") if w.strip()],
-        "logs":      [],
-        "trades":    [],
-        "fvg_count": 0,
-        "wins":      0,
-        "losses":    0,
-        "total_pnl": 0.0,
+        "logs": [], "trades": [],
+        "fvg_count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0,
         "settings": {
-            "timeframe":      TIMEFRAME,
-            "fvg_min_size":   0.001,
-            "risk_per_trade": 0.02,
-            "reward_ratio":   2.0,
-            "max_positions":  3,
-            "check_interval": 60,
-            "use_rsi":        True,
-            "use_volume":     False,
-            "use_ema_trend":  True,
-            "rsi_period":     14,
-            "rsi_oversold":   20,
-            "rsi_overbought": 80,
-            "volume_mult":    1.2,
+            "timeframe": TIMEFRAME, "fvg_min_size": 0.001,
+            "risk_per_trade": 0.02, "reward_ratio": 2.0,
+            "max_positions": 3, "check_interval": 60,
+            "use_rsi": True, "use_volume": False, "use_ema_trend": True,
+            "rsi_period": 14, "rsi_oversold": 20, "rsi_overbought": 80,
+            "volume_mult": 1.2,
         }
     }
 
@@ -62,7 +52,7 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE) as f:
                 saved = json.load(f)
-                base  = default_state()
+                base = default_state()
                 base.update(saved)
                 for k, v in default_state()["settings"].items():
                     if k not in base["settings"]:
@@ -77,28 +67,22 @@ def save_state():
         with open(STATE_FILE, "w") as f:
             json.dump({
                 "watchlist": state["watchlist"],
-                "logs":      state["logs"][:100],
-                "trades":    state["trades"][:100],
+                "logs": state["logs"][:100],
+                "trades": state["trades"][:100],
                 "fvg_count": state["fvg_count"],
-                "wins":      state["wins"],
-                "losses":    state["losses"],
+                "wins": state["wins"], "losses": state["losses"],
                 "total_pnl": state["total_pnl"],
-                "settings":  state["settings"],
+                "settings": state["settings"],
             }, f)
     except Exception as e:
         log.error(f"Save state: {e}")
 
 runtime = {
-    "running":     False,
-    "market_open": False,
-    "equity":      0.0,
-    "cash":        0.0,
-    "positions":   [],
-    "last_scan":   "Never",
-    "next_open":   "",
+    "running": False, "market_open": False,
+    "equity": 0.0, "cash": 0.0,
+    "positions": [], "last_scan": "Never", "next_open": "",
     "pdt_disabled": False,
 }
-
 state = load_state()
 
 def add_log(msg, level="info"):
@@ -111,13 +95,13 @@ def add_log(msg, level="info"):
     log.info(msg)
 
 # ─────────────────────────────────────────────
-# EXCEL
+# EXCEL — smart update (no duplicate rows)
 # ─────────────────────────────────────────────
 def init_excel():
     if os.path.exists(EXCEL_FILE):
         return
-    wb  = openpyxl.Workbook()
-    ws  = wb.active
+    wb = openpyxl.Workbook()
+    ws = wb.active
     ws.title = "Trade Log"
     headers = ["Date","Time","Symbol","Side","Qty","Entry ($)","SL ($)","TP ($)",
                "Exit ($)","P&L ($)","P&L (%)","Status","FVG Type","Trend","RSI","Notes"]
@@ -125,10 +109,9 @@ def init_excel():
     hfont = Font(bold=True, color="00FF88", name="Arial", size=10)
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
-        cell.font = hfont
-        cell.fill = hfill
+        cell.font = hfont; cell.fill = hfill
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    widths = [12,10,8,6,6,12,12,12,10,10,8,8,10,8,6,30]
+    widths = [12,10,8,6,6,12,12,12,10,10,8,8,10,8,6,35]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.row_dimensions[1].height = 20
@@ -150,7 +133,7 @@ def init_excel():
     ws2["B10"] = "=IFERROR(MIN('Trade Log'!J2:J10000),0)"
     wb.save(EXCEL_FILE)
 
-def write_excel_row(ws, nr, trade):
+def _write_row(ws, nr, trade):
     pnl = trade.get("pnl", 0.0)
     ent = trade.get("entry", 1)
     qty = trade.get("qty", 1)
@@ -170,12 +153,10 @@ def write_excel_row(ws, nr, trade):
             cell.font = Font(name="Arial", size=9,
                 color="00AA44" if val>0 else "CC0000" if val<0 else "888888")
         if col == 12:
-            if val == "WIN":
-                cell.fill = PatternFill("solid", fgColor="002200")
-                cell.font = Font(name="Arial", size=9, color="00FF88", bold=True)
-            elif val == "LOSS":
-                cell.fill = PatternFill("solid", fgColor="220000")
-                cell.font = Font(name="Arial", size=9, color="FF3D6E", bold=True)
+            colors = {"WIN":("002200","00FF88"), "LOSS":("220000","FF3D6E")}
+            if val in colors:
+                cell.fill = PatternFill("solid", fgColor=colors[val][0])
+                cell.font = Font(name="Arial", size=9, color=colors[val][1], bold=True)
             else:
                 cell.fill = PatternFill("solid", fgColor="1a1a2e")
                 cell.font = Font(name="Arial", size=9, color="FFD166", bold=True)
@@ -184,25 +165,22 @@ def write_excel_row(ws, nr, trade):
                 color="00FF88" if val=="BUY" else "FF3D6E", bold=True)
 
 def log_trade_excel(trade):
+    """Update existing row or append new one — never duplicates."""
     try:
         wb = openpyxl.load_workbook(EXCEL_FILE)
         ws = wb["Trade Log"]
         if trade.get("excel_row"):
-            write_excel_row(ws, trade["excel_row"], trade)
+            _write_row(ws, trade["excel_row"], trade)
         else:
-            existing_row = None
+            existing = None
             for r in range(2, ws.max_row + 1):
                 if (ws.cell(row=r, column=3).value == trade.get("symbol") and
                     ws.cell(row=r, column=2).value == trade.get("time")):
-                    existing_row = r
+                    existing = r
                     break
-            if existing_row:
-                trade["excel_row"] = existing_row
-                write_excel_row(ws, existing_row, trade)
-            else:
-                nr = ws.max_row + 1
-                trade["excel_row"] = nr
-                write_excel_row(ws, nr, trade)
+            nr = existing or (ws.max_row + 1)
+            trade["excel_row"] = nr
+            _write_row(ws, nr, trade)
         wb.save(EXCEL_FILE)
     except Exception as e:
         log.error(f"Excel error: {e}")
@@ -213,50 +191,50 @@ def log_trade_excel(trade):
 def get_api():
     return tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 
-def disable_pdt_protection(api):
-    """
-    Disable Pattern Day Trading protection on Alpaca paper account.
-    This allows unlimited day trades on paper accounts.
-    """
+def disable_pdt(api):
     try:
         import requests as req
-        resp = req.patch(
+        r = req.patch(
             f"{BASE_URL}/v2/account/configurations",
-            headers={
-                "APCA-API-KEY-ID":     API_KEY,
-                "APCA-API-SECRET-KEY": SECRET_KEY,
-            },
+            headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY},
             json={"pdt_check": "entry"}
         )
-        if resp.status_code == 200:
-            add_log("✅ PDT protection set to entry-only")
-            with lock:
-                runtime["pdt_disabled"] = True
+        if r.status_code == 200:
+            add_log("✅ PDT set to entry-only (trades allowed)")
+            with lock: runtime["pdt_disabled"] = True
         else:
-            add_log(f"⚠️ PDT config response: {resp.status_code} {resp.text}", "error")
+            add_log(f"⚠️ PDT config: {r.status_code}", "error")
     except Exception as e:
-        add_log(f"⚠️ PDT disable error: {e}", "error")
+        add_log(f"⚠️ PDT error: {e}", "error")
+
+def cancel_all_orders(api):
+    """Cancel stale open orders to free buying power."""
+    try:
+        orders = api.list_orders(status="open")
+        if orders:
+            api.cancel_all_orders()
+            add_log(f"🗑️ Cancelled {len(orders)} stale open orders")
+    except Exception as e:
+        log.error(f"Cancel orders: {e}")
 
 # ─────────────────────────────────────────────
-# MARKET OPEN CHECK
-# Uses Alpaca clock + UTC manual fallback
+# MARKET HOURS — Alpaca clock + UTC fallback
 # ─────────────────────────────────────────────
 def is_market_open(api):
-    utc_now     = datetime.now(timezone.utc)
-    utc_mins    = utc_now.hour * 60 + utc_now.minute
-    is_weekday  = utc_now.weekday() < 5
-    manual_open = is_weekday and 810 <= utc_mins <= 1200
-    next_open   = ""
+    utc     = datetime.now(timezone.utc)
+    mins    = utc.hour * 60 + utc.minute
+    weekday = utc.weekday() < 5
+    manual  = weekday and 810 <= mins <= 1200
+    next_open = ""
     try:
-        clock       = api.get_clock()
-        alpaca_open = clock.is_open
-        next_open   = str(clock.next_open)[:16]
-        return alpaca_open or manual_open, next_open
+        clock = api.get_clock()
+        next_open = str(clock.next_open)[:16]
+        return clock.is_open or manual, next_open
     except:
-        return manual_open, next_open
+        return manual, next_open
 
 # ─────────────────────────────────────────────
-# MARKET DATA + INDICATORS
+# INDICATORS
 # ─────────────────────────────────────────────
 def get_candles(api, symbol, tf=None, hours=10, limit=100):
     try:
@@ -267,125 +245,92 @@ def get_candles(api, symbol, tf=None, hours=10, limit=100):
                              start=start.isoformat()+"Z",
                              end=end.isoformat()+"Z",
                              limit=limit, feed="iex").df
-        if hasattr(bars.index, 'tz') and bars.index.tz is not None:
+        if hasattr(bars.index, "tz") and bars.index.tz:
             bars.index = bars.index.tz_localize(None)
         return bars if len(bars) >= 5 else None
     except Exception as e:
         err = str(e).lower()
-        if "subscription" not in err and "forbidden" not in err and "market" not in err:
+        if not any(x in err for x in ["subscription","forbidden","market","iex"]):
             add_log(f"⚠️ Candle {symbol}: {e}", "error")
         return None
 
 def calculate_rsi(closes, period=14):
     try:
-        if len(closes) < period + 1:
-            return 50.0
-        delta = closes.diff()
-        gain  = delta.where(delta > 0, 0.0).rolling(period).mean()
-        loss  = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-        rs    = gain / loss
-        rsi   = 100 - (100 / (1 + rs))
-        val   = float(rsi.iloc[-1])
-        return round(val, 1) if not pd.isna(val) else 50.0
-    except:
-        return 50.0
+        if len(closes) < period + 1: return 50.0
+        d = closes.diff()
+        g = d.where(d>0, 0.0).rolling(period).mean()
+        l = (-d.where(d<0, 0.0)).rolling(period).mean()
+        v = float((100 - (100/(1+(g/l)))).iloc[-1])
+        return round(v, 1) if not pd.isna(v) else 50.0
+    except: return 50.0
 
-def calculate_ema(closes, period):
+def calc_ema(closes, period):
     return closes.ewm(span=period, adjust=False).mean()
 
 def get_trend(api, symbol):
     try:
         bars = get_candles(api, symbol, tf="1Hour", hours=72, limit=50)
-        if bars is None or len(bars) < 21:
-            return "neutral"
-        closes = bars["close"]
-        ema20  = calculate_ema(closes, 20).iloc[-1]
-        ema50  = calculate_ema(closes, min(50, len(closes))).iloc[-1]
-        price  = closes.iloc[-1]
-        if price > ema20 and ema20 > ema50 * 0.999:
-            return "bullish"
-        if price < ema20 and ema20 < ema50 * 1.001:
-            return "bearish"
+        if bars is None or len(bars) < 21: return "neutral"
+        c  = bars["close"]
+        e20 = calc_ema(c, 20).iloc[-1]
+        e50 = calc_ema(c, min(50, len(c))).iloc[-1]
+        p   = c.iloc[-1]
+        if p > e20 and e20 > e50 * 0.999: return "bullish"
+        if p < e20 and e20 < e50 * 1.001: return "bearish"
         return "neutral"
-    except:
-        return "neutral"
+    except: return "neutral"
 
 def detect_fvg(bars):
-    fvgs     = []
+    fvgs = []
     min_size = state["settings"]["fvg_min_size"]
     for i in range(2, len(bars)):
-        c1 = bars.iloc[i-2]
-        c2 = bars.iloc[i-1]
-        c3 = bars.iloc[i]
-        c2_body  = abs(float(c2["close"]) - float(c2["open"]))
-        c2_range = float(c2["high"]) - float(c2["low"])
-        if c2_range == 0 or c2_body / c2_range < 0.3:
-            continue
-        c1_high = float(c1["high"])
-        c3_low  = float(c3["low"])
-        c1_low  = float(c1["low"])
-        c3_high = float(c3["high"])
-        if c3_low > c1_high:
-            gap = (c3_low - c1_high) / c1_high
+        c1, c2, c3 = bars.iloc[i-2], bars.iloc[i-1], bars.iloc[i]
+        body  = abs(float(c2["close"]) - float(c2["open"]))
+        rng   = float(c2["high"]) - float(c2["low"])
+        if rng == 0 or body/rng < 0.3: continue
+        c1h, c3l = float(c1["high"]), float(c3["low"])
+        c1l, c3h = float(c1["low"]),  float(c3["high"])
+        if c3l > c1h:
+            gap = (c3l - c1h) / c1h
             if gap >= min_size and float(c2["close"]) > float(c2["open"]):
-                score = gap * 100 * (i / len(bars))
-                fvgs.append({
-                    "type":     "bullish",
-                    "top":      c3_low,
-                    "bottom":   c1_high,
-                    "gap_size": round(gap * 100, 3),
-                    "score":    score,
-                    "c2_vol":   float(c2.get("volume", 0)),
-                })
-        elif c3_high < c1_low:
-            gap = (c1_low - c3_high) / c1_low
+                fvgs.append({"type":"bullish","top":c3l,"bottom":c1h,
+                             "gap_size":round(gap*100,3),
+                             "score":gap*100*(i/len(bars)),
+                             "c2_vol":float(c2.get("volume",0))})
+        elif c3h < c1l:
+            gap = (c1l - c3h) / c1l
             if gap >= min_size and float(c2["close"]) < float(c2["open"]):
-                score = gap * 100 * (i / len(bars))
-                fvgs.append({
-                    "type":     "bearish",
-                    "top":      c1_low,
-                    "bottom":   c3_high,
-                    "gap_size": round(gap * 100, 3),
-                    "score":    score,
-                    "c2_vol":   float(c2.get("volume", 0)),
-                })
+                fvgs.append({"type":"bearish","top":c1l,"bottom":c3h,
+                             "gap_size":round(gap*100,3),
+                             "score":gap*100*(i/len(bars)),
+                             "c2_vol":float(c2.get("volume",0))})
     return sorted(fvgs, key=lambda x: x["score"], reverse=True)
 
 def check_volume(bars, fvg):
     try:
-        if "volume" not in bars.columns:
-            return True
-        mult    = state["settings"]["volume_mult"]
-        avg_vol = bars["volume"].rolling(20).mean().iloc[-1]
-        if pd.isna(avg_vol) or avg_vol == 0:
-            return True
-        return float(fvg["c2_vol"]) > float(avg_vol) * mult
-    except:
-        return True
+        if "volume" not in bars.columns: return True
+        avg = bars["volume"].rolling(20).mean().iloc[-1]
+        if pd.isna(avg) or avg == 0: return True
+        return float(fvg["c2_vol"]) > float(avg) * state["settings"]["volume_mult"]
+    except: return True
 
 def price_in_fvg(price, fvg):
-    tolerance = fvg["bottom"] * 0.001
-    return (fvg["bottom"] - tolerance) <= price <= fvg["top"]
+    tol = fvg["bottom"] * 0.0005  # 0.05% tolerance only
+    return (fvg["bottom"] - tol) <= price <= fvg["top"]
 
 def calculate_qty(equity, cash, entry, stop_loss):
-    """Calculate position size based on risk % and available cash."""
-    risk       = state["settings"]["risk_per_trade"]
-    risk_amt   = equity * risk
-    risk_share = abs(entry - stop_loss)
-    if risk_share == 0:
-        return 0
-    shares     = risk_amt / risk_share
-    # BUG FIX: cap by cash available not just equity
-    max_by_cash   = (cash * 0.95) / entry  # use max 95% of cash
-    max_by_equity = (equity * 0.25) / entry
-    max_shares    = min(max_by_cash, max_by_equity)
-    qty           = int(min(shares, max_shares))
-    return max(1, qty) if cash >= entry else 0  # BUG FIX: dont trade if cant afford 1 share
+    risk     = state["settings"]["risk_per_trade"]
+    risk_amt = equity * risk
+    risk_per = abs(entry - stop_loss)
+    if risk_per == 0: return 0
+    by_risk  = risk_amt / risk_per
+    by_cash  = (cash * 0.95) / entry
+    by_equity = (equity * 0.25) / entry
+    qty = int(min(by_risk, by_cash, by_equity))
+    return max(1, qty) if cash >= entry else 0
 
 # ─────────────────────────────────────────────
 # TRADE EXECUTION
-# BUG FIX: Use market order + separate stop/tp orders
-# instead of bracket (bracket triggers PDT on paper)
 # ─────────────────────────────────────────────
 def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi):
     try:
@@ -393,68 +338,49 @@ def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi):
         sl    = round(float(sl), 2)
         tp    = round(float(tp), 2)
 
-        # Validate SL/TP logic
+        # Auto-fix invalid SL/TP
         if side == "buy":
-            if sl >= entry:
-                sl = round(entry * 0.985, 2)
-            if tp <= entry:
-                tp = round(entry * 1.03, 2)
+            if sl >= entry: sl = round(entry * 0.985, 2)
+            if tp <= entry: tp = round(entry * 1.03, 2)
         else:
-            if sl <= entry:
-                sl = round(entry * 1.015, 2)
-            if tp >= entry:
-                tp = round(entry * 0.97, 2)
+            if sl <= entry: sl = round(entry * 1.015, 2)
+            if tp >= entry: tp = round(entry * 0.97, 2)
 
-        # BUG FIX: Use limit order with bracket but set pdt_check to entry
-        # If that fails, fall back to market order without bracket
+        order_type = "BRACKET"
         try:
             api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                type="limit",
-                time_in_force="gtc",
+                symbol=symbol, qty=qty, side=side,
+                type="limit", time_in_force="gtc",
                 limit_price=entry,
                 order_class="bracket",
                 stop_loss={"stop_price": sl},
                 take_profit={"limit_price": tp}
             )
-            order_type = "BRACKET"
-        except Exception as bracket_err:
-            err_msg = str(bracket_err).lower()
-            if "pattern day" in err_msg or "pdt" in err_msg:
-                # Fall back to simple limit order
+        except Exception as be:
+            if "pattern day" in str(be).lower() or "pdt" in str(be).lower():
+                # Fallback: simple limit order
                 api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side=side,
-                    type="limit",
-                    time_in_force="gtc",
+                    symbol=symbol, qty=qty, side=side,
+                    type="limit", time_in_force="gtc",
                     limit_price=entry,
                 )
-                order_type = "LIMIT(no bracket-PDT)"
+                order_type = "LIMIT"
             else:
-                raise bracket_err
+                raise be
 
-        add_log(f"✅ {side.upper()} {qty} {symbol} @ ${entry} SL:${sl} TP:${tp} [{order_type}] RSI:{rsi}", "trade")
+        msg = f"✅ {side.upper()} {qty} {symbol} @ ${entry} SL:${sl} TP:${tp} RSI:{rsi} [{order_type}]"
+        add_log(msg, "trade")
 
         trade = {
-            "time":       datetime.now().strftime("%H:%M:%S"),
-            "date":       datetime.now().strftime("%d %b %Y"),
-            "symbol":     symbol,
-            "side":       side,
-            "qty":        qty,
-            "entry":      entry,
-            "sl":         sl,
-            "tp":         tp,
-            "exit_price": None,
-            "pnl":        0.0,
-            "status":     "OPEN",
-            "fvg_type":   fvg["type"],
-            "gap_size":   fvg["gap_size"],
-            "trend":      trend,
-            "rsi":        rsi,
-            "notes":      f"FVG {fvg['gap_size']}% trend={trend} RSI={rsi} {order_type}",
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "date": datetime.now().strftime("%d %b %Y"),
+            "symbol": symbol, "side": side, "qty": qty,
+            "entry": entry, "sl": sl, "tp": tp,
+            "exit_price": None, "pnl": 0.0, "status": "OPEN",
+            "fvg_type": fvg["type"], "gap_size": fvg["gap_size"],
+            "trend": trend, "rsi": rsi,
+            "notes": f"FVG {fvg['gap_size']}% trend={trend} RSI={rsi} [{order_type}]",
+            "excel_row": None,
         }
         with lock:
             state["trades"].insert(0, trade)
@@ -462,15 +388,13 @@ def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi):
                 state["trades"] = state["trades"][:100]
         log_trade_excel(trade)
         save_state()
-
     except Exception as e:
         add_log(f"❌ Order failed {symbol}: {e}", "error")
 
 def update_closed_trades(api):
     try:
-        orders    = api.list_orders(status="closed", limit=50)
-        total_pnl = 0.0
-        wins = losses = 0
+        orders = api.list_orders(status="closed", limit=50)
+        total_pnl = wins = losses = 0
         with lock:
             for t in state["trades"]:
                 if t["status"] != "OPEN":
@@ -479,34 +403,20 @@ def update_closed_trades(api):
                     total_pnl += t["pnl"]
                     continue
                 for o in orders:
-                    if o.symbol != t["symbol"]: continue
-                    if o.filled_avg_price is None: continue
-                    fp     = float(o.filled_avg_price)
-                    fq     = float(o.filled_qty or 0)
-                    o_side = str(o.side).lower()
-                    if t["side"] == "buy" and o_side == "sell":
-                        pnl = (fp - t["entry"]) * fq
-                        t["pnl"] = round(pnl, 2)
-                        t["exit_price"] = fp
-                        t["status"] = "WIN" if pnl > 0 else "LOSS"
+                    if o.symbol != t["symbol"] or not o.filled_avg_price: continue
+                    fp = float(o.filled_avg_price)
+                    fq = float(o.filled_qty or 0)
+                    os = str(o.side).lower()
+                    if (t["side"]=="buy" and os=="sell") or (t["side"]=="sell" and os=="buy"):
+                        pnl = (fp-t["entry"])*fq if t["side"]=="buy" else (t["entry"]-fp)*fq
+                        t.update({"pnl":round(pnl,2),"exit_price":fp,
+                                  "status":"WIN" if pnl>0 else "LOSS"})
                         total_pnl += pnl
-                        if pnl > 0: wins += 1
-                        else: losses += 1
+                        if pnl>0: wins+=1
+                        else: losses+=1
                         log_trade_excel(t)
                         break
-                    elif t["side"] == "sell" and o_side == "buy":
-                        pnl = (t["entry"] - fp) * fq
-                        t["pnl"] = round(pnl, 2)
-                        t["exit_price"] = fp
-                        t["status"] = "WIN" if pnl > 0 else "LOSS"
-                        total_pnl += pnl
-                        if pnl > 0: wins += 1
-                        else: losses += 1
-                        log_trade_excel(t)
-                        break
-            state["total_pnl"] = round(total_pnl, 2)
-            state["wins"]      = wins
-            state["losses"]    = losses
+            state.update({"total_pnl":round(total_pnl,2),"wins":wins,"losses":losses})
         save_state()
     except Exception as e:
         log.error(f"Update trades: {e}")
@@ -515,10 +425,8 @@ def update_closed_trades(api):
 # BOT LOOP
 # ─────────────────────────────────────────────
 def bot_loop():
-    add_log("🤖 FVG Bot started — Auto mode ON")
+    add_log("🤖 FVG Bot started — Auto mode")
     api = get_api()
-
-    # Step 1: Connect and show equity immediately
     try:
         acc = api.get_account()
         with lock:
@@ -527,172 +435,126 @@ def bot_loop():
         add_log(f"💰 Connected: ${float(acc.equity):,.2f}")
     except Exception as e:
         add_log(f"❌ Account error: {e}", "error")
+        with lock: runtime["running"] = False
         return
 
-    # Step 2: Disable PDT protection on paper account
-    disable_pdt_protection(api)
+    disable_pdt(api)
+    cancel_all_orders(api)
 
     while True:
         with lock:
-            if not runtime["running"]:
-                break
-
+            if not runtime["running"]: break
         try:
-            # Refresh account every loop
             try:
                 acc = api.get_account()
                 with lock:
                     runtime["equity"] = float(acc.equity)
                     runtime["cash"]   = float(acc.cash)
-            except:
-                pass
+            except: pass
 
-            # Check market - uses Alpaca clock + UTC fallback
-            market_open, next_open = is_market_open(api)
+            open_, next_open = is_market_open(api)
             with lock:
-                runtime["market_open"] = market_open
+                runtime["market_open"] = open_
                 runtime["next_open"]   = next_open
 
-            if not market_open:
+            if not open_:
                 add_log(f"💤 Market closed — next open: {next_open} UTC")
                 time.sleep(60)
                 continue
 
-            # Get positions
             positions = api.list_positions()
             pos_dict  = {p.symbol: p for p in positions}
-
             with lock:
                 runtime["last_scan"] = datetime.now().strftime("%H:%M:%S")
                 runtime["positions"] = [
-                    {
-                        "symbol":  p.symbol,
-                        "qty":     p.qty,
-                        "entry":   float(p.avg_entry_price),
-                        "current": float(p.current_price),
-                        "pnl":     float(p.unrealized_pl),
-                        "pnl_pct": round(float(p.unrealized_plpc) * 100, 2),
-                        "side":    "long" if float(p.qty) > 0 else "short"
-                    }
+                    {"symbol":p.symbol,"qty":p.qty,
+                     "entry":float(p.avg_entry_price),"current":float(p.current_price),
+                     "pnl":float(p.unrealized_pl),
+                     "pnl_pct":round(float(p.unrealized_plpc)*100,2),
+                     "side":"long" if float(p.qty)>0 else "short"}
                     for p in positions
                 ]
 
             update_closed_trades(api)
-
-            equity  = runtime["equity"]
-            cash    = runtime["cash"]
-            s       = state["settings"]
+            equity = runtime["equity"]
+            cash   = runtime["cash"]
+            s      = state["settings"]
             max_pos = s["max_positions"]
 
-            add_log(f"📡 Scanning {len(state['watchlist'])} stocks | ${equity:,.0f} | {len(pos_dict)}/{max_pos} pos")
+            add_log(f"📡 Scanning {len(state['watchlist'])} stocks | ${equity:,.0f} | {len(pos_dict)}/{max_pos}")
 
             if len(pos_dict) >= max_pos:
                 add_log(f"⚠️ Max {max_pos} positions — waiting")
                 time.sleep(s["check_interval"])
                 continue
 
-            watchlist = []
-            with lock:
-                watchlist = state["watchlist"][:]
+            with lock: watchlist = state["watchlist"][:]
 
             for symbol in watchlist:
                 with lock:
-                    if not runtime["running"]:
-                        break
-                if symbol in pos_dict:
-                    continue
+                    if not runtime["running"]: break
+                if symbol in pos_dict: continue
 
                 bars = get_candles(api, symbol)
-                if bars is None or len(bars) < 10:
-                    continue
+                if bars is None or len(bars) < 10: continue
 
                 price  = float(bars["close"].iloc[-1])
-                closes = bars["close"]
-                rsi    = calculate_rsi(closes, int(s["rsi_period"]))
+                rsi    = calculate_rsi(bars["close"], int(s["rsi_period"]))
                 trend  = get_trend(api, symbol) if s["use_ema_trend"] else "neutral"
                 fvgs   = detect_fvg(bars)
+                if not fvgs: continue
 
-                if not fvgs:
-                    continue
-
-                with lock:
-                    state["fvg_count"] += len(fvgs)
+                with lock: state["fvg_count"] += len(fvgs)
 
                 traded = False
                 for fvg in fvgs[:5]:
-                    if traded:
-                        break
-                    if not price_in_fvg(price, fvg):
-                        continue
-
-                    volume_ok = check_volume(bars, fvg) if s["use_volume"] else True
-                    reward    = s["reward_ratio"]
-
+                    if traded: break
+                    if not price_in_fvg(price, fvg): continue
+                    vol_ok = check_volume(bars, fvg) if s["use_volume"] else True
+                    reward = s["reward_ratio"]
                     add_log(f"🎯 {symbol} FVG({fvg['type']}) gap={fvg['gap_size']}% RSI={rsi} trend={trend}")
 
-                    # BULLISH ENTRY
-                    if fvg["type"] == "bullish" and trend in ["bullish", "neutral"]:
-                        rsi_ok = rsi < s["rsi_overbought"] if s["use_rsi"] else True
-                        if rsi_ok and volume_ok:
+                    if fvg["type"] == "bullish" and trend in ["bullish","neutral"]:
+                        if (not s["use_rsi"] or rsi < s["rsi_overbought"]) and vol_ok:
                             sl  = round(fvg["bottom"] * 0.997, 2)
-                            tp  = round(price + (price - sl) * reward, 2)
+                            tp  = round(price + (price-sl) * reward, 2)
                             qty = calculate_qty(equity, cash, price, sl)
                             if qty > 0:
                                 place_trade(api, symbol, "buy", qty, price, sl, tp, fvg, trend, rsi)
                                 traded = True
-                                break
 
-                    # BEARISH ENTRY
-                    elif fvg["type"] == "bearish" and trend in ["bearish", "neutral"]:
-                        rsi_ok = rsi > s["rsi_oversold"] if s["use_rsi"] else True
-                        if rsi_ok and volume_ok:
+                    elif fvg["type"] == "bearish" and trend in ["bearish","neutral"]:
+                        if (not s["use_rsi"] or rsi > s["rsi_oversold"]) and vol_ok:
                             sl  = round(fvg["top"] * 1.003, 2)
-                            tp  = round(price - (sl - price) * reward, 2)
+                            tp  = round(price - (sl-price) * reward, 2)
                             qty = calculate_qty(equity, cash, price, sl)
                             if qty > 0:
                                 place_trade(api, symbol, "sell", qty, price, sl, tp, fvg, trend, rsi)
                                 traded = True
-                                break
 
             save_state()
             time.sleep(s["check_interval"])
-
         except Exception as e:
             add_log(f"❌ Loop error: {e}", "error")
             time.sleep(30)
-
     add_log("⏹ Bot stopped")
 
-# ─────────────────────────────────────────────
-# AUTO-RESTART WATCHDOG
-# BUG FIX: If bot thread dies, restart it automatically
-# ─────────────────────────────────────────────
 def watchdog():
-    """Watchdog thread — restarts bot if it crashes."""
-    time.sleep(10)  # Wait for initial startup
+    time.sleep(15)
     while True:
         time.sleep(30)
-        with lock:
-            should_run = runtime["running"]
+        with lock: should_run = runtime["running"]
         if should_run:
-            # Check if bot thread is alive
-            alive = any(
-                t.name == "bot_thread" and t.is_alive()
-                for t in threading.enumerate()
-            )
+            alive = any(t.name=="bot_thread" and t.is_alive() for t in threading.enumerate())
             if not alive:
-                log.warning("⚠️ Bot thread died — restarting...")
-                add_log("🔄 Watchdog: restarting bot thread", "error")
-                t = threading.Thread(target=bot_loop, daemon=True, name="bot_thread")
-                t.start()
+                add_log("🔄 Watchdog: restarting bot", "error")
+                threading.Thread(target=bot_loop, daemon=True, name="bot_thread").start()
 
 def start_bot():
     with lock:
-        if runtime["running"]:
-            return
+        if runtime["running"]: return
         runtime["running"] = True
-    t = threading.Thread(target=bot_loop, daemon=True, name="bot_thread")
-    t.start()
+    threading.Thread(target=bot_loop, daemon=True, name="bot_thread").start()
 
 # ─────────────────────────────────────────────
 # FLASK
@@ -706,43 +568,32 @@ def index():
 
 @app.route("/api/status")
 def api_status():
-    # Always fetch live account
     try:
         acc = get_api().get_account()
         with lock:
             runtime["equity"] = float(acc.equity)
             runtime["cash"]   = float(acc.cash)
     except Exception as e:
-        log.error(f"Status account: {e}")
+        log.error(f"Status: {e}")
     with lock:
         return jsonify({
-            "running":      runtime["running"],
-            "market_open":  runtime["market_open"],
-            "next_open":    runtime["next_open"],
-            "equity":       runtime["equity"],
-            "cash":         runtime["cash"],
-            "positions":    runtime["positions"],
-            "last_scan":    runtime["last_scan"],
-            "fvg_count":    state["fvg_count"],
-            "total_pnl":    state["total_pnl"],
-            "wins":         state["wins"],
-            "losses":       state["losses"],
-            "watchlist":    state["watchlist"],
-            "logs":         state["logs"][:30],
-            "trades":       state["trades"][:20],
-            "settings":     state["settings"],
-            "pdt_disabled": runtime["pdt_disabled"],
+            "running": runtime["running"], "market_open": runtime["market_open"],
+            "next_open": runtime["next_open"], "equity": runtime["equity"],
+            "cash": runtime["cash"], "positions": runtime["positions"],
+            "last_scan": runtime["last_scan"], "fvg_count": state["fvg_count"],
+            "total_pnl": state["total_pnl"], "wins": state["wins"],
+            "losses": state["losses"], "watchlist": state["watchlist"],
+            "logs": state["logs"][:30], "trades": state["trades"][:20],
+            "settings": state["settings"], "pdt_disabled": runtime["pdt_disabled"],
         })
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    start_bot()
-    return jsonify({"ok": True})
+    start_bot(); return jsonify({"ok": True})
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    with lock:
-        runtime["running"] = False
+    with lock: runtime["running"] = False
     return jsonify({"ok": True})
 
 @app.route("/api/settings", methods=["POST"])
@@ -763,7 +614,7 @@ def api_settings():
         s["rsi_overbought"] = float(data.get("rsi_overbought", s["rsi_overbought"]))
         s["volume_mult"]    = float(data.get("volume_mult", s["volume_mult"]))
     save_state()
-    add_log(f"⚙️ Settings saved — RSI:{s['rsi_oversold']}-{s['rsi_overbought']} Vol:{'ON' if s['use_volume'] else 'OFF'} EMA:{'ON' if s['use_ema_trend'] else 'OFF'}")
+    add_log(f"⚙️ Settings saved")
     return jsonify({"ok": True, "settings": state["settings"]})
 
 @app.route("/api/watchlist/add/<symbol>", methods=["POST"])
@@ -773,8 +624,7 @@ def api_add(symbol):
         if symbol in state["watchlist"]:
             return jsonify({"ok": False, "msg": f"{symbol} already in watchlist"})
         state["watchlist"].append(symbol)
-    save_state()
-    add_log(f"➕ Added {symbol}")
+    save_state(); add_log(f"➕ Added {symbol}")
     return jsonify({"ok": True, "watchlist": state["watchlist"]})
 
 @app.route("/api/watchlist/remove/<symbol>", methods=["POST"])
@@ -784,52 +634,40 @@ def api_remove(symbol):
         if symbol not in state["watchlist"]:
             return jsonify({"ok": False, "msg": "Not found"})
         state["watchlist"].remove(symbol)
-    save_state()
-    add_log(f"➖ Removed {symbol}")
+    save_state(); add_log(f"➖ Removed {symbol}")
     return jsonify({"ok": True, "watchlist": state["watchlist"]})
 
 @app.route("/api/clear_logs", methods=["POST"])
 def api_clear_logs():
-    with lock:
-        state["logs"] = []
-    save_state()
-    return jsonify({"ok": True})
+    with lock: state["logs"] = []
+    save_state(); return jsonify({"ok": True})
 
 @app.route("/api/download_excel")
 def download_excel():
     from flask import send_file
-    if not os.path.exists(EXCEL_FILE):
-        init_excel()
+    if not os.path.exists(EXCEL_FILE): init_excel()
     return send_file(EXCEL_FILE, as_attachment=True, download_name="fvg_trades.xlsx")
 
 @app.route("/ping")
-def ping():
-    return "pong", 200
+def ping(): return "pong", 200
 
 @app.route("/api/test")
 def api_test():
     try:
         acc = get_api().get_account()
-        return jsonify({
-            "connected": True,
-            "equity":    float(acc.equity),
-            "base_url":  BASE_URL,
-            "status":    acc.status
-        })
+        return jsonify({"connected":True,"equity":float(acc.equity),"base_url":BASE_URL})
     except Exception as e:
-        return jsonify({"connected": False, "error": str(e), "base_url": BASE_URL})
+        return jsonify({"connected":False,"error":str(e),"base_url":BASE_URL})
 
 # ─────────────────────────────────────────────
-# STARTUP — auto-start bot + watchdog
+# STARTUP
 # ─────────────────────────────────────────────
 init_excel()
-
 if API_KEY and SECRET_KEY:
     start_bot()
     threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
-    log.info("✅ Bot and watchdog started automatically")
 else:
-    log.warning("⚠️ No API keys — bot not started")
+    log.warning("⚠️ No API keys")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
