@@ -350,7 +350,7 @@ def place_trade(api, symbol, side, qty, entry, sl, tp, fvg, trend, rsi, volume_o
             return
         api.submit_order(
             symbol=symbol, qty=qty, side=side,
-            type="limit", time_in_force="day",
+            type="limit", time_in_force="gtc",
             limit_price=entry,
             order_class="bracket",
             stop_loss={"stop_price": sl},
