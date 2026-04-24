@@ -484,41 +484,64 @@ def bot_loop():
                 if symbol in pos_dict: continue
 
                 bars=get_candles(symbol)
-                if bars is None or len(bars)<10: continue
+                if bars is None or len(bars)<10:
+                    add_log(f"📊 {symbol}: no candle data")
+                    continue
 
-                price=float(bars["close"].iloc[-1])
-                rsi=calc_rsi(bars["close"],int(s["rsi_period"]))
-                trend=get_trend(symbol) if s["use_ema_trend"] else "neutral"
-                fvgs=detect_fvg(bars)
+                price = float(bars["close"].iloc[-1])
+                rsi   = calc_rsi(bars["close"], int(s["rsi_period"]))
+                trend = get_trend(symbol) if s["use_ema_trend"] else "neutral"
+                fvgs  = detect_fvg(bars)
+
+                add_log(f"📊 {symbol} ${price:.2f} RSI={rsi} {trend} FVGs={len(fvgs)}")
                 if not fvgs: continue
 
-                with lock: state["fvg_count"]+=len(fvgs)
+                with lock: state["fvg_count"] += len(fvgs)
+                reward  = s["reward_ratio"]
+                traded  = False
 
-                traded=False
-                for fvg in fvgs[:5]:
+                for fvg in fvgs[:3]:
                     if traded: break
-                    if not price_in_fvg(price,fvg): continue
-                    reward=s["reward_ratio"]
-                    add_log(f"🎯 {symbol} {fvg['type']} gap={fvg['gap_size']}% RSI={rsi} {trend}")
+                    ftype = fvg["type"]
+                    add_log(f"🎯 {symbol} {ftype} gap={fvg['gap_size']}% top={fvg['top']:.2f} bot={fvg['bottom']:.2f}")
 
-                    if fvg["type"]=="bullish" and trend in ["bullish","neutral"]:
-                        if not s["use_rsi"] or rsi<s["rsi_overbought"]:
-                            sl=round(fvg["bottom"]*0.997,2)
-                            tp=round(price+(price-sl)*reward,2)
-                            qty=calc_qty(equity,cash,price,sl)
-                            if qty>0:
-                                place_order(symbol,"buy",qty,price,sl,tp,fvg,trend,rsi)
-                                traded=True
+                    # BULLISH — buy when price is at or below gap top
+                    if ftype == "bullish" and trend in ["bullish","neutral"]:
+                        if price <= fvg["top"] * 1.005:
+                            if not s["use_rsi"] or rsi < s["rsi_overbought"]:
+                                entry = round(price, 2)
+                                sl    = round(min(fvg["bottom"] * 0.997, entry * 0.985), 2)
+                                tp    = round(entry + (entry - sl) * reward, 2)
+                                qty   = calc_qty(equity, cash, entry, sl)
+                                if qty > 0:
+                                    place_order(symbol,"buy",qty,entry,sl,tp,fvg,trend,rsi)
+                                    traded = True
+                                else:
+                                    add_log(f"⚠️ {symbol} qty=0 cash=${cash:.0f} entry=${entry}")
+                            else:
+                                add_log(f"⏭️ {symbol} RSI={rsi} overbought skip")
+                        else:
+                            add_log(f"⏭️ {symbol} price ${price:.2f} > gap top ${fvg['top']:.2f}")
 
-                    elif fvg["type"]=="bearish" and trend in ["bearish","neutral"]:
-                        if not s["use_rsi"] or rsi>s["rsi_oversold"]:
-                            sl=round(fvg["top"]*1.003,2)
-                            tp=round(price-(sl-price)*reward,2)
-                            qty=calc_qty(equity,cash,price,sl)
-                            if qty>0:
-                                place_order(symbol,"sell",qty,price,sl,tp,fvg,trend,rsi)
-                                traded=True
-
+                    # BEARISH — sell when price is at or above gap bottom
+                    elif ftype == "bearish" and trend in ["bearish","neutral"]:
+                        if price >= fvg["bottom"] * 0.995:
+                            if not s["use_rsi"] or rsi > s["rsi_oversold"]:
+                                entry = round(price, 2)
+                                sl    = round(max(fvg["top"] * 1.003, entry * 1.015), 2)
+                                tp    = round(entry - (sl - entry) * reward, 2)
+                                qty   = calc_qty(equity, cash, entry, sl)
+                                if qty > 0:
+                                    place_order(symbol,"sell",qty,entry,sl,tp,fvg,trend,rsi)
+                                    traded = True
+                                else:
+                                    add_log(f"⚠️ {symbol} qty=0 cash=${cash:.0f} entry=${entry}")
+                            else:
+                                add_log(f"⏭️ {symbol} RSI={rsi} oversold skip")
+                        else:
+                            add_log(f"⏭️ {symbol} price ${price:.2f} < gap bot ${fvg['bottom']:.2f}")
+                    else:
+                        add_log(f"⏭️ {symbol} trend mismatch: fvg={ftype} trend={trend}")
             save_state()
             time.sleep(s["check_interval"])
 
