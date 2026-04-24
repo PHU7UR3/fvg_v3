@@ -103,11 +103,12 @@ input:checked+.slider::before{transform:translateX(16px)}
   </div>
   <div class="hright">
     <div class="badge"><div class="dot off" id="dotBot"></div><span id="txtBot">CONNECTING</span></div>
-    <button class="btn sm grey" id="btnBot" onclick="toggleBot()">▶ Start</button>
+    <div class="badge"><span id="txtMkt">🕐 Checking...</span></div>
     <button class="btn sm gold" onclick="downloadExcel()">📥 Excel</button>
+    <button class="btn sm red" onclick="closeAll()">🔴 Close All</button>
     <button class="btn sm grey" onclick="clearLogs()">Clear</button>
   </div>
-</header>
+  </header>
 
 <!-- Market Clock Bar — IST -->
 <div class="clock-bar">
@@ -294,7 +295,7 @@ function render(d){
   // Bot badge
   const dot=document.getElementById('dotBot');
   const txt=document.getElementById('txtBot');
-  const btn=document.getElementById('btnBot');
+  const btn=//removed;
   if(d.running){
     dot.classList.remove('off');txt.textContent='BOT RUNNING';
     btn.textContent='⏹ Stop';btn.className='btn sm red';
@@ -418,11 +419,7 @@ function renderLogs(logs){
   }).join('');
 }
 
-async function toggleBot(){
-  const running=lastData&&lastData.running;
-  await fetch(running?'/api/stop':'/api/start',{method:'POST'});
-  await poll();
-}
+
 
 async function addStock(){
   const sym=document.getElementById('symInput').value.trim().toUpperCase();
@@ -496,6 +493,14 @@ function notify(msg){
   n.className='notif';n.textContent=msg;
   document.body.appendChild(n);
   setTimeout(()=>n.remove(),3000);
+}
+
+async function closeAll(){
+  if(!confirm('Close ALL positions and cancel ALL orders? This cannot be undone.')) return;
+  const r=await fetch('/api/close_all',{method:'POST'});
+  const d=await r.json();
+  notify(d.ok?'✅ All positions closed & orders cancelled':'❌ '+d.error);
+  await poll();
 }
 
 document.getElementById('symInput').addEventListener('keydown',e=>{if(e.key==='Enter')addStock();});
