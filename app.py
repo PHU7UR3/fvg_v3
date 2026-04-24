@@ -394,19 +394,14 @@ def monitor_and_close():
                 elif sl and current >= sl: hit = "SL"
             if hit:
                 try:
-                    # Use Alpaca REST DELETE to close position - bypasses PDT
-                    try:
-                        r2 = req.delete(
-                            f"{BASE_URL}/v2/positions/{sym}",
-                            headers=alpaca_headers()
-                        )
-                        if r2.status_code not in [200, 204]:
-                            # Fallback to market order
-                            close_side = "sell" if is_long else "buy"
-                            api.submit_order(symbol=sym,qty=qty,side=close_side,
-                                             type="market",time_in_force="gtc")
-                    except Exception as ce:
-                        add_log(f"⚠️ Close {sym}: {ce}","error")
+                    # Use Alpaca REST DELETE — bypasses PDT
+                    r2 = req.delete(
+                        f"{BASE_URL}/v2/positions/{sym}",
+                        headers=alpaca_headers()
+                    )
+                    add_log(f"🔄 Close {sym} [{hit}] status:{r2.status_code}")
+                    if r2.status_code not in [200, 204, 207]:
+                        add_log(f"⚠️ Close {sym} failed: {r2.text[:100]}", "error")
                         continue
                     pnl = float(pos.unrealized_pl)
                     icon = "✅" if pnl>0 else "❌"
