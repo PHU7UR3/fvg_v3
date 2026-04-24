@@ -362,18 +362,36 @@ def monitor_and_close():
             current = float(pos.current_price)
             qty     = abs(int(float(pos.qty)))
             is_long = float(pos.qty) > 0
+            entry   = float(pos.avg_entry_price)
+            pnl_pct = float(pos.unrealized_plpc) * 100
+
+            # Get TP/SL from stored trade if available
             with lock:
                 trade = next((t for t in state["trades"]
                               if t["symbol"]==sym and t["status"]=="OPEN"), None)
-            if not trade: continue
-            tp=trade.get("tp",0); sl=trade.get("sl",0)
+
+            if trade:
+                tp = trade.get("tp", 0)
+                sl = trade.get("sl", 0)
+            else:
+                # No trade record — use default % targets
+                # TP: +2% for long, -2% for short
+                # SL: -1% for long, +1% for short
+                reward = state["settings"]["reward_ratio"]
+                if is_long:
+                    tp = round(entry * 1.02, 2)
+                    sl = round(entry * 0.99, 2)
+                else:
+                    tp = round(entry * 0.98, 2)
+                    sl = round(entry * 1.01, 2)
+
             hit = None
             if is_long:
-                if tp and current>=tp: hit="TP"
-                elif sl and current<=sl: hit="SL"
+                if tp and current >= tp: hit = "TP"
+                elif sl and current <= sl: hit = "SL"
             else:
-                if tp and current<=tp: hit="TP"
-                elif sl and current>=sl: hit="SL"
+                if tp and current <= tp: hit = "TP"
+                elif sl and current >= sl: hit = "SL"
             if hit:
                 try:
                     # Use Alpaca REST DELETE to close position - bypasses PDT
