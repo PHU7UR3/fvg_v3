@@ -246,7 +246,7 @@ const SECTORS={
   "🔌 Semis":["INTC","QCOM","NVDA","AMD","AMAT","ASML"],
 };
 
-let lastData=null, settingsLoaded=false;
+let lastData=null;
 
 // ── IST Clock ─────────────────────────────────────────────────────
 function updateClock(){
@@ -337,8 +337,7 @@ function render(d){
   renderLogs(d.logs||[]);
 
   // Settings — populate once
-  if(d.settings&&!settingsLoaded){
-    settingsLoaded=true;
+  if(d.settings){
     const s=d.settings;
     setVal('sTF',      s.timeframe);
     setVal('sFVG',     (s.fvg_min_size*100).toFixed(2));
