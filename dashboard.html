@@ -286,22 +286,21 @@ async function poll(){
     lastData=d;
     render(d);
   }catch(e){
-    document.getElementById('txtBot').textContent='DISCONNECTED';
+    if(document.getElementById('txtBot')) document.getElementById('txtBot').textContent='DISCONNECTED';
     document.getElementById('dotBot').classList.add('off');
   }
 }
 
 function render(d){
-  // Bot badge
+  // Bot status — fully automatic, no buttons
   const dot=document.getElementById('dotBot');
   const txt=document.getElementById('txtBot');
-  const btn=//removed;
   if(d.running){
-    dot.classList.remove('off');txt.textContent='BOT RUNNING';
-    btn.textContent='⏹ Stop';btn.className='btn sm red';
+    dot.classList.remove('off');
+    txt.textContent='🤖 AUTO';
   }else{
-    dot.classList.add('off');txt.textContent='BOT STOPPED';
-    btn.textContent='▶ Start';btn.className='btn sm grey';
+    dot.classList.add('off');
+    txt.textContent='STARTING...';
   }
 
   // Next open
