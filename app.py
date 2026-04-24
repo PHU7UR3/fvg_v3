@@ -212,21 +212,27 @@ def is_market_open():
 # INDICATORS
 # ─────────────────────────────────────────────
 def get_candles(symbol, tf=None, hours=10):
-    try:
-        api = get_api()
-        tf  = tf or state["settings"]["timeframe"]
-        end = datetime.utcnow()
-        bars = api.get_bars(symbol, tf,
-            start=(end-timedelta(hours=hours)).isoformat()+"Z",
-            end=end.isoformat()+"Z", limit=100, feed="iex").df
-        if hasattr(bars.index,"tz") and bars.index.tz:
-            bars.index = bars.index.tz_localize(None)
-        return bars if len(bars)>=5 else None
-    except Exception as e:
-        err = str(e).lower()
-        if not any(x in err for x in ["subscription","iex","forbidden","market","closed"]):
-            add_log(f"⚠️ Candle {symbol}: {e}", "error")
-        return None
+    api = get_api()
+    tf  = tf or state["settings"]["timeframe"]
+    end = datetime.utcnow()
+    start = (end-timedelta(hours=hours)).isoformat()+"Z"
+    end_  = end.isoformat()+"Z"
+    # Try iex first, then sip as fallback
+    for feed in ["iex", "sip"]:
+        try:
+            bars = api.get_bars(symbol, tf, start=start, end=end_,
+                                limit=100, feed=feed).df
+            if hasattr(bars.index,"tz") and bars.index.tz:
+                bars.index = bars.index.tz_localize(None)
+            if len(bars) >= 5:
+                return bars
+        except Exception as e:
+            err = str(e).lower()
+            if "subscription" in err or "forbidden" in err:
+                continue  # try next feed
+            if "market" not in err and "closed" not in err:
+                log.warning(f"Candle {symbol} ({feed}): {e}")
+    return None
 
 def calc_rsi(closes, period=14):
     try:
@@ -237,17 +243,33 @@ def calc_rsi(closes, period=14):
         return round(v,1) if not pd.isna(v) else 50.0
     except: return 50.0
 
+_trend_cache = {}
+_trend_cache_time = {}
+
 def get_trend(symbol):
+    """Cache trend for 5 minutes to reduce API calls."""
+    now = datetime.utcnow()
+    if symbol in _trend_cache:
+        age = (now - _trend_cache_time[symbol]).total_seconds()
+        if age < 300:  # 5 min cache
+            return _trend_cache[symbol]
     try:
-        bars = get_candles(symbol, tf="1Hour", hours=72)
-        if bars is None or len(bars)<21: return "neutral"
+        bars = get_candles(symbol, tf="1Hour", hours=48)
+        if bars is None or len(bars)<21:
+            _trend_cache[symbol] = "neutral"
+            _trend_cache_time[symbol] = now
+            return "neutral"
         c=bars["close"]; p=c.iloc[-1]
         e20=c.ewm(span=20,adjust=False).mean().iloc[-1]
         e50=c.ewm(span=min(50,len(c)),adjust=False).mean().iloc[-1]
-        if p>e20 and e20>e50*0.999: return "bullish"
-        if p<e20 and e20<e50*1.001: return "bearish"
+        if p>e20 and e20>e50*0.999: trend="bullish"
+        elif p<e20 and e20<e50*1.001: trend="bearish"
+        else: trend="neutral"
+        _trend_cache[symbol] = trend
+        _trend_cache_time[symbol] = now
+        return trend
+    except:
         return "neutral"
-    except: return "neutral"
 
 def detect_fvg(bars):
     fvgs=[]; ms=state["settings"]["fvg_min_size"]
@@ -359,8 +381,18 @@ def monitor_and_close():
             if hit:
                 try:
                     close_side = "sell" if is_long else "buy"
-                    api.submit_order(symbol=sym,qty=qty,side=close_side,
-                                     type="market",time_in_force="gtc")
+                    # Try market order, fallback to limit at current price
+                    try:
+                        api.submit_order(symbol=sym,qty=qty,side=close_side,
+                                         type="market",time_in_force="day")
+                    except Exception as ce:
+                        if "pattern day" in str(ce).lower() or "pdt" in str(ce).lower():
+                            # Use limit order at current price to avoid PDT
+                            api.submit_order(symbol=sym,qty=qty,side=close_side,
+                                             type="limit",time_in_force="gtc",
+                                             limit_price=round(current,2))
+                        else:
+                            raise ce
                     pnl = float(pos.unrealized_pl)
                     icon = "✅" if pnl>0 else "❌"
                     add_log(f"{icon} CLOSED {sym} [{hit}] @${current:.2f} PnL:${pnl:.2f}","trade")
