@@ -166,7 +166,7 @@ def alpaca_headers():
     return {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}
 
 def setup_account():
-    """Disable PDT, cancel all orders, close all positions on startup."""
+    """Disable PDT and cancel unfilled orders on startup. Keep existing positions."""
     try:
         r = req.patch(f"{BASE_URL}/v2/account/configurations",
                       headers=alpaca_headers(), json={"pdt_check": "entry"})
@@ -176,24 +176,20 @@ def setup_account():
 
     try:
         api = get_api()
+        # Only cancel NEW/PENDING orders, not filled ones
         orders = api.list_orders(status="open")
-        if orders:
-            api.cancel_all_orders()
-            add_log(f"🗑️ Cancelled {len(orders)} open orders")
-    except Exception as e:
-        add_log(f"⚠️ Cancel orders: {e}", "error")
-
-    try:
-        api = get_api()
+        new_orders = [o for o in orders if str(o.status) in ["new","pending_new","accepted"]]
+        if new_orders:
+            for o in new_orders:
+                try: api.cancel_order(o.id)
+                except: pass
+            add_log(f"🗑️ Cancelled {len(new_orders)} pending orders")
+        # Keep existing filled positions — don't close them
         positions = api.list_positions()
         if positions:
-            for p in positions:
-                try: api.close_position(p.symbol)
-                except: pass
-            add_log(f"🔴 Closed {len(positions)} existing positions — fresh start")
-            time.sleep(2)
+            add_log(f"📊 Keeping {len(positions)} existing positions")
     except Exception as e:
-        add_log(f"⚠️ Close positions: {e}", "error")
+        add_log(f"⚠️ Setup: {e}", "error")
 
 def is_market_open():
     utc = datetime.now(timezone.utc)
@@ -631,12 +627,9 @@ def api_status():
 
 @app.route("/api/start",methods=["POST"])
 def api_start():
-    start_bot(); return jsonify({"ok":True})
-
-@app.route("/api/stop",methods=["POST"])
-def api_stop():
-    with lock: runtime["running"]=False
-    return jsonify({"ok":True})
+    # Bot is fully automatic - always running
+    start_bot()
+    return jsonify({"ok":True,"msg":"Bot is automatic"})
 
 @app.route("/api/close_all",methods=["POST"])
 def api_close_all():
