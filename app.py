@@ -422,6 +422,89 @@ def update_closed_trades(api):
         log.error(f"Update trades: {e}")
 
 # ─────────────────────────────────────────────
+# POSITION MONITOR — auto close when TP/SL hit
+# Runs every 30 seconds, checks all open positions
+# against their stored TP and SL targets
+# ─────────────────────────────────────────────
+def monitor_positions(api):
+    """Check open positions and close if TP or SL hit."""
+    try:
+        positions = api.list_positions()
+        if not positions:
+            return
+
+        with lock:
+            trades_copy = [t for t in state["trades"] if t["status"] == "OPEN"]
+
+        for pos in positions:
+            symbol  = pos.symbol
+            qty     = abs(int(float(pos.qty)))
+            current = float(pos.current_price)
+            side    = "long" if float(pos.qty) > 0 else "short"
+
+            # Find matching trade for TP/SL levels
+            trade = None
+            with lock:
+                for t in state["trades"]:
+                    if t["symbol"] == symbol and t["status"] == "OPEN":
+                        trade = t
+                        break
+
+            if not trade:
+                continue
+
+            tp = trade.get("tp", 0)
+            sl = trade.get("sl", 0)
+            should_close = False
+            reason = ""
+
+            if side == "long":
+                if tp and current >= tp:
+                    should_close = True
+                    reason = f"TP hit @ ${current:.2f}"
+                elif sl and current <= sl:
+                    should_close = True
+                    reason = f"SL hit @ ${current:.2f}"
+            else:
+                if tp and current <= tp:
+                    should_close = True
+                    reason = f"TP hit @ ${current:.2f}"
+                elif sl and current >= sl:
+                    should_close = True
+                    reason = f"SL hit @ ${current:.2f}"
+
+            if should_close:
+                try:
+                    close_side = "sell" if side == "long" else "buy"
+                    api.submit_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side=close_side,
+                        type="market",
+                        time_in_force="gtc",
+                    )
+                    pnl = float(pos.unrealized_pl)
+                    add_log(f"{'✅' if pnl>0 else '❌'} CLOSED {symbol} {reason} PnL:${pnl:.2f}", "trade")
+                    with lock:
+                        for t in state["trades"]:
+                            if t["symbol"] == symbol and t["status"] == "OPEN":
+                                t["pnl"]        = round(pnl, 2)
+                                t["exit_price"] = current
+                                t["status"]     = "WIN" if pnl > 0 else "LOSS"
+                                log_trade_excel(t)
+                                break
+                        if pnl > 0: state["wins"] += 1
+                        else: state["losses"] += 1
+                        state["total_pnl"] = round(state.get("total_pnl", 0) + pnl, 2)
+                    save_state()
+                except Exception as e:
+                    add_log(f"⚠️ Close {symbol} failed: {e}", "error")
+
+    except Exception as e:
+        log.error(f"Monitor positions: {e}")
+
+
+# ─────────────────────────────────────────────
 # BOT LOOP
 # ─────────────────────────────────────────────
 def bot_loop():
@@ -476,6 +559,7 @@ def bot_loop():
                 ]
 
             update_closed_trades(api)
+            monitor_positions(api)
             equity = runtime["equity"]
             cash   = runtime["cash"]
             s      = state["settings"]
@@ -647,6 +731,33 @@ def download_excel():
     from flask import send_file
     if not os.path.exists(EXCEL_FILE): init_excel()
     return send_file(EXCEL_FILE, as_attachment=True, download_name="fvg_trades.xlsx")
+
+
+@app.route("/api/close_all", methods=["POST"])
+def api_close_all():
+    """Emergency: cancel all orders and close all positions."""
+    try:
+        api = get_api()
+        # Cancel all open orders
+        try:
+            api.cancel_all_orders()
+            add_log("🗑️ All open orders cancelled")
+        except Exception as e:
+            add_log(f"⚠️ Cancel orders: {e}", "error")
+        # Close all positions
+        try:
+            positions = api.list_positions()
+            for p in positions:
+                api.close_position(p.symbol)
+            add_log(f"🔴 Closed {len(positions)} positions")
+        except Exception as e:
+            add_log(f"⚠️ Close positions: {e}", "error")
+        # Reset runtime positions
+        with lock:
+            runtime["positions"] = []
+        return jsonify({"ok": True, "msg": "All orders cancelled and positions closed"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/ping")
 def ping(): return "pong", 200
