@@ -376,19 +376,20 @@ def monitor_and_close():
                 elif sl and current>=sl: hit="SL"
             if hit:
                 try:
-                    close_side = "sell" if is_long else "buy"
-                    # Try market order, fallback to limit at current price
+                    # Use Alpaca REST DELETE to close position - bypasses PDT
                     try:
-                        api.submit_order(symbol=sym,qty=qty,side=close_side,
-                                         type="market",time_in_force="day")
-                    except Exception as ce:
-                        if "pattern day" in str(ce).lower() or "pdt" in str(ce).lower():
-                            # Use limit order at current price to avoid PDT
+                        r2 = req.delete(
+                            f"{BASE_URL}/v2/positions/{sym}",
+                            headers=alpaca_headers()
+                        )
+                        if r2.status_code not in [200, 204]:
+                            # Fallback to market order
+                            close_side = "sell" if is_long else "buy"
                             api.submit_order(symbol=sym,qty=qty,side=close_side,
-                                             type="limit",time_in_force="gtc",
-                                             limit_price=round(current,2))
-                        else:
-                            raise ce
+                                             type="market",time_in_force="gtc")
+                    except Exception as ce:
+                        add_log(f"⚠️ Close {sym}: {ce}","error")
+                        continue
                     pnl = float(pos.unrealized_pl)
                     icon = "✅" if pnl>0 else "❌"
                     add_log(f"{icon} CLOSED {sym} [{hit}] @${current:.2f} PnL:${pnl:.2f}","trade")
@@ -660,12 +661,13 @@ def api_close_all():
             results.append(f"Cancelled {len(orders)} orders")
         except Exception as e: results.append(f"Orders error: {e}")
         try:
-            positions=api.list_positions()
-            closed=0
-            for p in positions:
-                try: api.close_position(p.symbol); closed+=1
-                except Exception as e: results.append(f"Close {p.symbol}: {e}")
-            results.append(f"Closed {closed} positions")
+            # Use Alpaca's liquidate all endpoint - bypasses PDT
+            r2 = req.delete(
+                f"{BASE_URL}/v2/positions",
+                headers=alpaca_headers(),
+                params={"cancel_orders": "true"}
+            )
+            results.append(f"Liquidate all: {r2.status_code}")
             with lock: runtime["positions"]=[]
         except Exception as e: results.append(f"Positions error: {e}")
         add_log(f"🔴 Close all: {'; '.join(results)}")
